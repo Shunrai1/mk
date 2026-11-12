@@ -72,20 +72,27 @@ function resolveImageSrc(src: string | undefined, filePath: string | null): stri
   return 'file:///' + absolute.replace(/\\/g, '/').replace(/^\/+/, '')
 }
 
+let flashTimer = 0
+
 /** 页内锚点（脚注引用 / 返回正文）在预览区内滚动定位，并短暂高亮目标 */
 function jumpToAnchor(root: HTMLElement | null, id: string): void {
   const target = root?.querySelector<HTMLElement>(`#${CSS.escape(id)}`)
   if (!target) return
   target.scrollIntoView({ block: 'center' })
+  root?.querySelectorAll('.anchor-flash').forEach((el) => el.classList.remove('anchor-flash'))
+  window.clearTimeout(flashTimer)
+  // 强制重排，连续点击同一个脚注也能重新播放高亮
+  void target.offsetWidth
   target.classList.add('anchor-flash')
-  window.setTimeout(() => target.classList.remove('anchor-flash'), 1200)
+  flashTimer = window.setTimeout(() => target.classList.remove('anchor-flash'), 1200)
 }
 
 export function Preview({ content, filePath }: { content: string; filePath: string | null }) {
   const rootRef = useRef<HTMLDivElement>(null)
   const components = useMemo<Components>(
     () => ({
-      a({ href, children, ...props }) {
+      // node 是 react-markdown 注入的 hast 节点，必须剔除，否则会被当成 DOM 属性渲染出去
+      a({ node, href, children, ...props }) {
         return (
           <a
             {...props}
@@ -101,7 +108,7 @@ export function Preview({ content, filePath }: { content: string; filePath: stri
           </a>
         )
       },
-      img({ src, alt, ...props }) {
+      img({ node, src, alt, ...props }) {
         return (
           <img
             {...props}

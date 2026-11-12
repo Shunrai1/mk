@@ -4,6 +4,14 @@ export type FileResult =
   | { ok: true; path: string; content: string }
   | { ok: false; canceled?: boolean; error?: string }
 export type SaveResult = { ok: true; path: string } | { ok: false; canceled?: boolean; error?: string }
+export type UpdateEvent =
+  | { type: 'idle' }
+  | { type: 'available'; version: string }
+  | { type: 'progress'; percent: number }
+  | { type: 'downloaded'; version: string }
+export type UpdateCheckResult =
+  | { ok: true; status: 'available' | 'not-available'; version?: string }
+  | { ok: false; message: string }
 
 function subscribe(channel: string, cb: (...args: never[]) => void): () => void {
   const listener = (_e: Electron.IpcRendererEvent, ...args: unknown[]): void => {
@@ -33,6 +41,11 @@ const api = {
   clearRecentFiles: (): Promise<void> => ipcRenderer.invoke('recent:clear'),
   openExternal: (url: string): void => ipcRenderer.send('shell:open-external', url),
   getPathForFile: (file: File): string => webUtils.getPathForFile(file),
+  checkUpdate: (): Promise<UpdateCheckResult> => ipcRenderer.invoke('update:check'),
+  downloadUpdate: (): Promise<{ ok: boolean; message?: string }> => ipcRenderer.invoke('update:download'),
+  installUpdate: (): void => ipcRenderer.send('update:install'),
+  getUpdateState: (): Promise<UpdateEvent> => ipcRenderer.invoke('update:get-state'),
+  onUpdateEvent: (cb: (event: UpdateEvent) => void): (() => void) => subscribe('update:event', cb),
   onMenuAction: (cb: (action: string) => void): (() => void) => subscribe('menu:action', cb),
   onCloseRequested: (cb: () => void): (() => void) => subscribe('app:close-requested', cb)
 }

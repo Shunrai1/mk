@@ -25,6 +25,13 @@ body {
   color: var(--text);
   background: var(--bg);
   overflow: hidden;
+}
+
+/* 只有界面外壳禁止选中；编辑区与预览区必须可选中，
+   否则 CodeMirror 的鼠标拖动选择会被一并禁用。 */
+.toolbar,
+.statusbar,
+.modal {
   user-select: none;
 }
 
@@ -254,6 +261,7 @@ body {
 .editor-pane {
   display: flex;
   overflow: hidden;
+  user-select: text;
 }
 
 .editor-pane > * {
@@ -265,6 +273,29 @@ body {
 .editor-pane .cm-editor {
   height: 100%;
   font-size: 14px;
+}
+
+/* basicSetup 启用了 drawSelection，选区由 CodeMirror 自绘，
+   必须显式给 .cm-selectionBackground 配色，否则拖动选中几乎看不见。 */
+.editor-pane .cm-selectionBackground {
+  background: #cfe0fd !important;
+}
+
+.editor-pane .cm-focused .cm-selectionBackground {
+  background: #b7d2fb !important;
+}
+
+.editor-pane .cm-content ::selection {
+  background: #cfe0fd !important;
+}
+
+.editor-pane .cm-selectionMatch {
+  background: #ffe9c2;
+}
+
+.editor-pane .cm-cursor,
+.editor-pane .cm-dropCursor {
+  border-left-color: var(--accent);
 }
 
 .editor-pane .cm-scroller {
@@ -449,59 +480,114 @@ body {
   color: var(--muted);
 }
 
+/* ---------- 脚注 ---------- */
 .markdown-body .footnotes {
-  margin-top: 2em;
+  margin-top: 2.4em;
   padding-top: 1.2em;
-  font-size: 0.9em;
+  font-size: 0.92em;
   color: #57606a;
   border-top: 1px solid var(--border);
 }
 
 .markdown-body .footnotes-title {
-  margin: 0 0 0.6em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 0.7em;
   padding: 0;
   border: none;
-  font-size: 1.05em;
+  font-size: 1em;
   font-weight: 600;
-  color: #57606a;
+  color: var(--text);
+}
+
+.markdown-body .footnotes-title::before {
+  content: '';
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--accent);
 }
 
 .markdown-body .footnotes ol {
-  padding-left: 1.6em;
   margin: 0;
+  padding-left: 1.6em;
 }
 
 .markdown-body .footnotes li {
-  margin: 0.35em 0;
+  margin: 0.4em 0;
+  padding-left: 0.2em;
+}
+
+.markdown-body .footnotes li::marker {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.markdown-body .footnotes li > p {
+  margin: 0;
+}
+
+/* sup 默认会缩小一次，若引用再用 em 就会叠缩到 10px（既看不清也点不中）。
+   这里让 sup 只负责上移，徽章用固定字号保证可读与可点。 */
+.markdown-body sup {
+  position: relative;
+  top: -0.5em;
+  font-size: 1em;
+  line-height: 0;
+  vertical-align: baseline;
 }
 
 .markdown-body a[data-footnote-ref] {
-  padding: 0 0.3em;
-  font-size: 0.8em;
+  display: inline-block;
+  padding: 0 5px;
+  font-size: 12px;
   font-weight: 600;
+  line-height: 1.45;
+  color: var(--accent);
   text-decoration: none;
   background: var(--accent-soft);
-  border-radius: 4px;
+  border: 1px solid #cfe0fd;
+  border-radius: 6px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.markdown-body a[data-footnote-ref]::before {
+  content: '[';
+  opacity: 0.5;
+}
+
+.markdown-body a[data-footnote-ref]::after {
+  content: ']';
+  opacity: 0.5;
 }
 
 .markdown-body a[data-footnote-ref]:hover {
-  background: #d8e6fd;
+  color: #fff;
   text-decoration: none;
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .markdown-body .data-footnote-backref {
-  margin-left: 0.3em;
+  display: inline-block;
+  margin-left: 0.4em;
+  padding: 0 5px;
   font-weight: 600;
   text-decoration: none;
+  background: var(--accent-soft);
+  border-radius: 5px;
+  transition: background 0.15s;
 }
 
 .markdown-body .data-footnote-backref:hover {
+  background: #d8e6fd;
   text-decoration: none;
 }
 
 /* 页内锚点跳转后的短暂高亮 */
 .markdown-body .anchor-flash {
-  border-radius: 4px;
+  border-radius: 5px;
   animation: anchor-flash 1.2s ease-out;
 }
 
@@ -509,9 +595,11 @@ body {
   0%,
   35% {
     background: #fff3c4;
+    box-shadow: 0 0 0 4px #fff3c4;
   }
   100% {
     background: transparent;
+    box-shadow: 0 0 0 4px transparent;
   }
 }
 
@@ -589,6 +677,73 @@ body {
 
 .status-meta {
   flex: none;
+}
+
+/* ---------- 更新通知 ---------- */
+.update-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  background: var(--accent-soft);
+  border-top: 1px solid #cfe0fd;
+  user-select: none;
+}
+
+.update-text {
+  flex: none;
+}
+
+.update-progress {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: #d8e6fd;
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.update-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.update-actions button {
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.update-actions button:hover:not(:disabled) {
+  background: #f2f4f7;
+}
+
+.update-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.update-actions button.primary:hover:not(:disabled) {
+  background: #1d4fd7;
+}
+
+.update-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 /* ---------- 关闭确认弹窗 ---------- */

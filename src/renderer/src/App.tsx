@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
 import { Preview } from './Preview'
+import type { UpdateEvent } from '../../preload'
 
 type ViewMode = 'edit' | 'split' | 'preview'
 
@@ -42,7 +43,7 @@ const WELCOME = [
   '- [x] GitHub Flavored Markdown',
   '- [ ] 试着在左侧编辑这一行',
   '',
-  '脚注示例：点击这个上标会跳到文末脚注[^1]，再点脚注末尾的 ↩ 可以跳回来。',
+  '脚注示例：点击上标[^1]会跳到文末脚注，再点脚注末尾的 ↩ 可以跳回来；同一篇文档支持多个脚注[^2]。',
   '',
   '### 代码高亮',
   '',
@@ -72,6 +73,7 @@ const WELCOME = [
   '> 提示：点击工具栏右侧「设为 .md 默认应用」可一键将本应用设为 Markdown 文件的默认打开方式（安装版），设置成功后按钮自动隐藏。',
   '',
   '[^1]: 这是一个脚注。',
+  '[^2]: 第二个脚注，编号按正文中首次引用的顺序排列。',
   ''
 ].join('\n')
 
@@ -112,6 +114,9 @@ export default function App() {
   const [recentOpen, setRecentOpen] = useState(false)
   const [recentFiles, setRecentFiles] = useState<string[]>([])
   const recentRef = useRef<HTMLDivElement>(null)
+  const [update, setUpdate] = useState<UpdateEvent>({ type: 'idle' })
+  const [updateDismissed, setUpdateDismissed] = useState(false)
+  const [updateBusy, setUpdateBusy] = useState(false)
 
   const dirty = content !== savedContent
 
@@ -242,6 +247,21 @@ export default function App() {
     }
   }, [])
 
+  const doCheckUpdate = useCallback(async (): Promise<void> => {
+    setStatus('正在检查更新…')
+    const result = await window.api.checkUpdate()
+    if (!result.ok) setStatus(`检查更新失败：${result.message}`)
+    else if (result.status === 'not-available') setStatus('当前已是最新版本')
+    else setStatus(`发现新版本 v${result.version}`)
+  }, [])
+
+  const doDownloadUpdate = useCallback(async (): Promise<void> => {
+    setUpdateBusy(true)
+    const result = await window.api.downloadUpdate()
+    setUpdateBusy(false)
+    if (!result.ok) setStatus(`下载更新失败：${result.message ?? '未知错误'}`)
+  }, [])
+
   const handleMenuAction = useCallback(
     (action: string) => {
       switch (action) {
@@ -266,9 +286,12 @@ export default function App() {
         case 'set-default':
           void setDefault()
           break
+        case 'check-update':
+          void doCheckUpdate()
+          break
       }
     },
-    [doOpen, doSave, doSaveAs, setDefault]
+    [doOpen, doSave, doSaveAs, setDefault, doCheckUpdate]
   )
 
   // 订阅主进程事件 + 读取启动时传入的文件
@@ -289,6 +312,16 @@ export default function App() {
   useEffect(() => {
     window.api.setDocState({ dirty, path: filePath })
   }, [dirty, filePath])
+
+  // 订阅更新事件；新窗口打开时恢复主进程已有的更新状态
+  useEffect(() => {
+    const off = window.api.onUpdateEvent((event) => {
+      setUpdate(event)
+      if (event.type === 'available' || event.type === 'downloaded') setUpdateDismissed(false)
+    })
+    void window.api.getUpdateState().then(setUpdate)
+    return off
+  }, [])
 
   // 拖拽打开
   useEffect(() => {
@@ -437,6 +470,45 @@ export default function App() {
           </section>
         )}
       </main>
+
+      {update.type !== 'idle' && !updateDismissed && (
+        <div className="update-banner" role="status">
+          {update.type === 'available' && (
+            <>
+              <span className="update-text">发现新版本 v{update.version}</span>
+              <div className="update-actions">
+                <button
+                  className="primary"
+                  onClick={() => void doDownloadUpdate()}
+                  disabled={updateBusy}
+                >
+                  {updateBusy ? '准备下载…' : '立即更新'}
+                </button>
+                <button onClick={() => setUpdateDismissed(true)}>稍后</button>
+              </div>
+            </>
+          )}
+          {update.type === 'progress' && (
+            <>
+              <span className="update-text">正在下载新版本… {update.percent}%</span>
+              <div className="update-progress">
+                <div className="update-progress-fill" style={{ width: `${update.percent}%` }} />
+              </div>
+            </>
+          )}
+          {update.type === 'downloaded' && (
+            <>
+              <span className="update-text">新版本 v{update.version} 已就绪</span>
+              <div className="update-actions">
+                <button className="primary" onClick={() => window.api.installUpdate()}>
+                  重启安装
+                </button>
+                <button onClick={() => setUpdateDismissed(true)}>稍后</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <footer className="statusbar">
         <span className="status-path" title={filePath ?? undefined}>

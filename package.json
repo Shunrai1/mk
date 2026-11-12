@@ -10,12 +10,17 @@
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit",
     "preview": "electron-vite preview",
-    "dist": "electron-vite build && electron-builder --win",
-    "dist:dir": "electron-vite build && electron-builder --win --dir"
+    "dist": "electron-vite build && electron-builder --win --publish never",
+    "dist:dir": "electron-vite build && electron-builder --win --dir --publish never",
+    "dist:mac": "electron-vite build && electron-builder --mac --publish never",
+    "dist:mac:dir": "electron-vite build && electron-builder --mac --dir --publish never",
+    "release:win": "electron-vite build && electron-builder --win --publish always",
+    "release:mac": "electron-vite build && electron-builder --mac --publish always"
   },
   "dependencies": {
     "@codemirror/lang-markdown": "^6.3.1",
     "@uiw/react-codemirror": "^4.23.6",
+    "electron-updater": "^6.8.11",
     "highlight.js": "^11.10.0",
     "katex": "^0.16.11",
     "mermaid": "^12.3.0",
@@ -82,6 +87,39 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Markdown笔记本"
-    }
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "category": "public.app-category.productivity",
+      "artifactName": "mkdown-${version}-${arch}.${ext}",
+      "identity": null,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "title": "Markdown笔记本 ${version}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Shunrai1",
+        "repo": "mk",
+        "releaseType": "release"
+      }
+    ]
   }
 }

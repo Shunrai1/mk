@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from 'fs'
 import { readFile, writeFile } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { autoUpdater } from 'electron-updater'
 
 const execFileAsync = promisify(execFile)
 
@@ -21,6 +22,8 @@ const MD_EXT = /\.(md|markdown|mdown|mkd)$/i
 const APP_NAME = 'Markdown笔记本'
 const APP_USER_MODEL_ID = 'com.mkdown.notebook'
 const NEW_WINDOW_FLAG = '--new-window'
+/** 开发模式图标：打包后由 exe 自带图标，无需指定 */
+const DEV_ICON = join(app.getAppPath(), 'build', 'icon.ico')
 
 /** 每个窗口独立维护文档状态，互不影响 */
 type WindowState = {
@@ -132,6 +135,7 @@ function createWindow(filePath: string | null = null): BrowserWindow {
     minWidth: 760,
     minHeight: 480,
     title: APP_NAME,
+    icon: app.isPackaged ? undefined : DEV_ICON,
     backgroundColor: '#f5f6f8',
     show: false,
     webPreferences: {
@@ -207,7 +211,7 @@ function registerUserTasks(): void {
       arguments: app.isPackaged
         ? NEW_WINDOW_FLAG
         : `"${app.getAppPath()}" ${NEW_WINDOW_FLAG}`,
-      iconPath: process.execPath,
+      iconPath: app.isPackaged ? process.execPath : DEV_ICON,
       iconIndex: 0,
       title: '新建窗口',
       description: '打开一个空白的 Markdown 窗口'
@@ -322,6 +326,59 @@ async function setDefaultMarkdownApp(): Promise<{ ok: boolean; message: string }
   } catch (err) {
     return { ok: false, message: `注册失败：${(err as Error).message}` }
   }
+}
+
+/** 自动更新：主进程广播事件，由渲染器展示通知，用户决定是否下载/安装 */
+type UpdateEvent =
+  | { type: 'idle' }
+  | { type: 'available'; version: string }
+  | { type: 'progress'; percent: number }
+  | { type: 'downloaded'; version: string }
+
+type UpdateCheckResponse =
+  | { ok: true; status: 'available' | 'not-available'; version?: string }
+  | { ok: false; message: string }
+
+let updateState: UpdateEvent = { type: 'idle' }
+let updateCheckPromise: Promise<Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>> | null = null
+
+function broadcastUpdate(event: UpdateEvent): void {
+  updateState = event
+  for (const win of BrowserWindow.getAllWindows()) sendTo(win, 'update:event', event)
+}
+
+/** 复用进行中的检查，避免启动定时器/菜单/多窗口并发触发重复检查 */
+function checkForUpdates(): Promise<Awaited<ReturnType<typeof autoUpdater.checkForUpdates>>> {
+  if (!updateCheckPromise) {
+    updateCheckPromise = autoUpdater.checkForUpdates().finally(() => {
+      updateCheckPromise = null
+    })
+  }
+  return updateCheckPromise
+}
+
+function setupAutoUpdater(): void {
+  // 开发模式没有 app-update.yml，跳过
+  if (!app.isPackaged) return
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.on('update-available', (info) => {
+    broadcastUpdate({ type: 'available', version: info.version })
+  })
+  autoUpdater.on('download-progress', (progress) => {
+    broadcastUpdate({ type: 'progress', percent: Math.round(progress.percent) })
+  })
+  autoUpdater.on('update-downloaded', (info) => {
+    broadcastUpdate({ type: 'downloaded', version: info.version })
+  })
+  autoUpdater.on('error', (err) => {
+    // 静默记录：启动自动检查失败（如离线）不打扰用户，手动操作的错误经 IPC 返回
+    console.error('[autoUpdater]', err)
+  })
+  // 延迟启动检查，避免与首屏渲染争抢资源
+  setTimeout(() => {
+    void checkForUpdates().catch(() => {})
+  }, 5000)
 }
 
 function registerIpc(): void {
@@ -443,6 +500,33 @@ function registerIpc(): void {
     saveRecentFiles()
     if (RECENT_DOCS_SUPPORTED) app.clearRecentDocuments()
   })
+
+  ipcMain.handle('update:get-state', (): UpdateEvent => updateState)
+
+  ipcMain.handle('update:check', async (): Promise<UpdateCheckResponse> => {
+    if (!app.isPackaged) return { ok: false, message: '开发模式不支持检查更新，请使用安装版。' }
+    try {
+      const result = await checkForUpdates()
+      const version = result?.updateInfo.version
+      if (version && version !== app.getVersion()) return { ok: true, status: 'available', version }
+      return { ok: true, status: 'not-available' }
+    } catch (err) {
+      return { ok: false, message: (err as Error).message }
+    }
+  })
+
+  ipcMain.handle('update:download', async (): Promise<{ ok: boolean; message?: string }> => {
+    try {
+      await autoUpdater.downloadUpdate()
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, message: (err as Error).message }
+    }
+  })
+
+  ipcMain.on('update:install', () => {
+    autoUpdater.quitAndInstall()
+  })
 }
 
 function buildMenu(): void {
@@ -537,6 +621,10 @@ function buildMenu(): void {
           }
         },
         {
+          label: '检查更新…',
+          click: (_item, win) => sendTo(menuTarget(win), 'menu:action', 'check-update')
+        },
+        {
           label: '关于',
           click: () => {
             const win = activeWindow()
@@ -590,6 +678,7 @@ if (!gotTheLock) {
     registerIpc()
     buildMenu()
     registerUserTasks()
+    setupAutoUpdater()
     createWindow(earlyOpenPath ?? fileFromArgv(process.argv))
     void isDefaultMarkdownApp().then((v) => {
       if (v !== defaultAppRegistered) {

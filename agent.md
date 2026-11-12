@@ -153,13 +153,27 @@ node scripts/generate-icon.mjs  # 重新生成 build/icon.ico 与 icon.png
 写在行内代码里的 `` `[^1]` `` 不算引用，孤立的定义会被直接丢弃；二是 `a` 组件统一 `preventDefault`，
 因此 `#` 开头的页内锚点必须自行处理——`jumpToAnchor` 在预览容器内按 id 定位、`scrollIntoView` 居中
 并加 1.2s `anchor-flash` 高亮。这里不用 `behavior: 'smooth'`：窗口不可见时 Chromium 会暂停平滑滚动动画，
-导致跳转静默失效。
+导致跳转静默失效。重复点击同一目标时先移除 class、读一次 `offsetWidth` 强制重排再添加，动画才会重播。
+
+脚注徽章尺寸：`sup` 自带一次缩小，若 `a[data-footnote-ref]` 再用 `em` 就会叠缩到 10px（实测 10×13px，
+既看不清也点不中）。因此 `.markdown-body sup` 只负责上移（`font-size: 1em; line-height: 0; top: -0.5em`），
+徽章本身用固定 `font-size: 12px` + 内边距 + `::before/::after` 补出 `[` `]`，实测 24×19px。
+
+自定义组件必须剔除 `node`：react-markdown 会把 hast 节点作为 `node` prop 传进来，
+若直接 `{...props}` 展开就会在 DOM 上渲染出非法属性 `node="[object Object]"`。
+`a` / `img` 均先解构出 `node` 再展开其余 props。
 
 编辑器布局注意：`@uiw/react-codemirror` 的 `height="100%"` 只写进 CodeMirror 主题（作用于 `.cm-editor`），
 不会设置外层包裹 `div.cm-theme-light` 的高度。若包裹层高度为 `auto`，`.cm-editor` / `.cm-scroller` 的
 百分比高度会退化成内容高度，编辑器被整体撑开且无法滚动。因此 `.editor-pane` 设为
 `display: flex; overflow: hidden`，并用 `.editor-pane > * { flex: 1; min-height: 0 }` 让包裹层撑满，
 滚动始终由内部 `.cm-scroller` 承担。
+
+文本选中：`user-select: none` 只能加在界面外壳（`.toolbar` / `.statusbar` / `.modal`），
+绝不能加在 `body` 上——它会一路继承到 `.cm-content`，使编辑区鼠标拖动选择完全失效
+（实测选区长度为 0、`.cm-selectionBackground` 数量为 0）。`.editor-pane` 显式声明 `user-select: text`。
+另外 basicSetup 默认启用 `drawSelection()`，选区由 CodeMirror 自绘，必须给
+`.cm-selectionBackground` 显式配色（用 `!important` 压过 CM 主题的更高特异性），否则选中几乎看不见。
 
 ## 9. 已知限制
 
