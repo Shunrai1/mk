@@ -81,23 +81,62 @@ Electron 继承 Chromium 多进程架构：
 
 ## 5. 文件关联与默认打开方式
 
-本项目采用「安装期注册 + 运行期一键自动设置」：
+本项目采用「安装期注册 + 运行期一键自动设置」，Windows 与 macOS 分别实现：
 
-1. **安装期**：electron-builder NSIS 配置 `fileAssociations`（.md / .markdown，role: Editor），
-   安装后出现在"打开方式"候选列表。
-2. **运行期**：应用内"设为 .md 默认应用"按钮（仅打包后生效）向 HKCU 写入：
-   - `Software\Classes\Applications\mkdown.exe`：open 命令、FriendlyAppName、SupportedTypes
-   - `...\Capabilities\FileAssociations`：`.md / .markdown → mkdown.md` ProgId
-   - `Software\Classes\mkdown.md`：ProgId 描述、DefaultIcon、open 命令
+1. **安装期**：electron-builder NSIS 配置 `fileAssociations`（.md / .markdown，role: Editor，
+   mimeType: text/markdown），安装后出现在"打开方式"候选列表；macOS 据此生成
+   `CFBundleDocumentTypes`，LaunchServices 才能把 `.md`（UTI `net.daringfireball.markdown`）
+   登记到本应用名下。
+2. **运行期（Windows）**：应用内「设为默认应用」按钮 / 帮助菜单（仅打包后生效）向 HKCU 写入：
+   - `Software\Classes\Applications\<exe 名>`：open 命令、FriendlyAppName、SupportedTypes
+   - `...\Capabilities\FileAssociations`：`.md / .markdown → Markdown Document` ProgId
+   - `Software\Classes\Markdown Document`：ProgId 描述、DefaultIcon、open 命令
+     （与安装期 electron-builder 使用同一个 ProgId，避免两套 ProgId 并存）
    - `Software\RegisteredApplications`：登记 Capabilities
    随后自动完成默认设置，无需打开系统设置页：
-   - 删除 `Explorer\FileExts\.md / .markdown` 的旧 `UserChoice`（不存在或失败则忽略）
-   - 写入 `Software\Classes\.md / .markdown` 默认值为 `mkdown.md`
+   - 删除 `Explorer\FileExts\.md / .markdown` 的旧 `UserChoice` **与 `UserChoiceLatest`**
+     （不存在或失败则忽略）。Win11 22H2+ 以 `UserChoiceLatest` 为准，只删 `UserChoice` 无效；
+     注意它是**子键**：路径为 `UserChoiceLatest\ProgId`，值名也叫 `ProgId`，用 `/ve` 读不到。
+   - 写入 `Software\Classes\.md / .markdown` 默认值为 `Markdown Document`
+   - 删除被系统保护、写入未生效时 `shell.openExternal('ms-settings:defaultapps')`
+     直接带用户到系统设置页兜底
    - `ie4uinit.exe -show` 刷新资源管理器图标（尽力而为）
-3. **状态检测**：`app:get-default-state` 读取 `UserChoice.ProgId`，不存在时回退
-   `Classes\.md` 默认值。工具栏按钮仅在"尚未默认"时显示；设置成功后复查并自动隐藏，
-   菜单项同步变为禁用的"已是 Markdown 默认应用"。若 UserChoice 受系统保护无法删除，
-   则提示用户到 Windows 设置中手动选择（兜底路径）。
+3. **运行期（macOS）**：`osascript -l JavaScript` 调用 LaunchServices：
+   - 设置：`LSSetDefaultRoleHandlerForContentType('net.daringfireball.markdown', 4, 'com.mkdown.notebook')`
+   - 检测：`LSCopyDefaultRoleHandlerForContentType(uti, 4)` 取当前 bundle id 比对
+   - `kLSRolesEditor` 在 JXA 中常量桥接不可靠，直接传数值 `4`；字符串参数用 `$()` 包成 CFStringRef
+   - 失败时提示用户在 Finder「显示简介 → 全部更改」手动设置
+4. **状态检测**：
+   - Windows：依次读 `UserChoice.ProgId` → `UserChoiceLatest\ProgId`（`/v ProgId`）→
+     `Classes\.md` 默认值，任一命中本应用即为默认。本应用的 ProgId 有两个：
+     运行期注册的 `mkdown.md`，以及 electron-builder 安装期用 association `name` 生成的
+     `Markdown Document`（含空格），两者都要认，否则通过系统设置选的默认会被误判。
+   - `reg.exe query` 解析坑：值里可能有空格（必须 `/REG_SZ\s+(.+)/` 后再 `trim()`，
+     用 `\S+` 会把 `Markdown Document` 截成 `Markdown`）；值未设置时输出占位文本
+     「(值未设置)」/「(value not set)」，必须当作不存在，否则会中断回退链导致误判。
+   - **编码坑（必须遵守）**：中文 Windows 下 `reg.exe` 输出是 GBK，Node 的 `execFile` 默认按
+     UTF-8 解码，含中文的 exe 路径（如 `Markdown笔记本.exe`）会变成乱码，
+     `existsSync`/字符串比对因此恒为 false——注册表明明正确，检测却一直判「未默认」并弹出
+     fallback 提示。凡是要拿含中文的路径做判断的，一律改用 PowerShell
+     （`Get-Item -LiteralPath` + `.GetValue('')` + `Test-Path`）在脚本内部完成比对，
+     只回传 `1`/`0` 这类纯 ASCII 结果（见 `runPowerShell`）。
+   - **命令健康校验**：ProgId 名字命中还不够，还要读 `ProgId\shell\open\command`
+     取出 exe 路径（兼容带/不带引号），确认文件存在且 basename 与 `process.execPath` 一致。
+     应用换过安装目录（如 `D:\Program Files\mk` → `%LOCALAPPDATA%\Programs\mk`）后，
+     注册表会残留旧路径，只比名字会误判为「已默认」，实际双击打不开。
+   - **ProgId 形式**：Win11 在「打开方式」里选中本应用后，`UserChoice` 里记录的可能是
+     `Applications\<exe 名>` 而非 ProgId 名，`isOwnProgId` 一并识别。
+   - **自愈**：`ensureOwnRegistration()` 在启动/聚焦复查与一键设置前，把两个自有 ProgId
+     （`Markdown Document`、历史别名 `mkdown.md`）的 open 命令与 DefaultIcon 重写到当前
+     `process.execPath`，但不改变用户选择的默认程序。
+   - 检测结果决定工具栏按钮与菜单项：未默认时显示「设为默认应用」，成功后隐藏 / 菜单项变为
+     禁用的「已是 Markdown 默认应用」。窗口获得焦点时（3 秒节流）复查一次，
+     用户在系统设置 / Finder 里改过默认也能及时同步。
+5. **文件图标**：`ProgId\DefaultIcon` 必须写成 `"<exe 全路径>",0`——引号只包住路径，
+   图标索引放在引号外。写成 `"<exe 全路径>,0"`（把 `,0` 也括进去）会被 shell 当成一个
+   不存在的文件名，静默回落到通用空白文档图标，且注册表查询看起来完全正常，极难排查。
+   修改后需 `ie4uinit.exe -ClearIconCache` + `-show` 并广播 `SHChangeNotify`，
+   资源管理器里按 F5 即可看到新图标。
 
 文件传入路径的处理：
 
@@ -196,5 +235,8 @@ schema 需注意两点：`clobberPrefix: ''`（脚注 id 已由 remark 加过前
   electron.exe 而非应用入口），应用内「打开」下拉不受影响；打包安装后正常。
 - ~~开发模式下文档内相对路径本地图片可能不显示（webSecurity）~~：现已改走 `mkimg://` 协议，
   开发与打包模式都能显示；仅当页面被外部地址接管（非同源 iframe）时才可能受限。
-- 若旧 UserChoice 受系统保护无法删除，自动默认设置会失败，
+- 若旧 UserChoice / UserChoiceLatest 受系统保护无法删除，Windows 自动默认设置会失败，
   需用户在 Windows 设置 → 默认应用中手动选择一次（兜底路径）。
+- macOS 的默认应用设置走 LaunchServices，若应用不在 /Applications、或系统未把本应用
+  登记为 `.md` 的处理程序，`LSSetDefaultRoleHandlerForContentType` 可能不生效，
+  需用 Finder「显示简介 → 全部更改」手动设置（兜底路径）。

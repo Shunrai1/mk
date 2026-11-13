@@ -124,7 +124,8 @@ const ICONS = {
   chevronDown: 'M6 9l6 6 6-6',
   chevronUp: 'M18 15l-6-6-6 6',
   close: 'M18 6L6 18M6 6l12 12',
-  sync: 'M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4'
+  sync: 'M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4',
+  check: 'M20 6L9 17l-5-5'
 }
 
 export default function App() {

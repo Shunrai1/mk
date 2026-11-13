@@ -270,6 +270,13 @@ function createWindow(filePath: string | null = null): BrowserWindow {
 
   win.on('focus', () => {
     lastFocusedWindow = win
+    // 用户可能在其他地方（系统设置 / Finder）改过默认应用，重新切回本应用时复查一次；
+    // 系统调用较贵，3 秒内只查一次
+    const now = Date.now()
+    if (now - lastDefaultCheck > 3000) {
+      lastDefaultCheck = now
+      void refreshDefaultState()
+    }
   })
   win.on('ready-to-show', () => win.show())
 
@@ -336,6 +343,8 @@ function registerUserTasks(): void {
 }
 
 let defaultAppRegistered = false
+/** 最近一次默认应用检测时间（毫秒），用于窗口聚焦时的复查节流 */
+let lastDefaultCheck = 0
 
 /** 查询注册表字符串值（兼容中文系统输出），不存在时返回 null */
 async function queryRegValue(key: string, valueName: string): Promise<string | null> {
@@ -345,45 +354,210 @@ async function queryRegValue(key: string, valueName: string): Promise<string | n
       ['query', key, ...(valueName ? ['/v', valueName] : ['/ve'])],
       { windowsHide: true }
     )
-    const m = stdout.match(/REG_SZ\s+(\S+)/)
-    return m ? m[1] : null
+    // 值里可能有空格（electron-builder 注册的 ProgId 就叫「Markdown Document」），
+    // 用 \S+ 会把值截断，导致后续比对永远不成立
+    const m = stdout.match(/REG_SZ\s+(.+)/)
+    if (!m) return null
+    const v = m[1].trim()
+    // 默认值未设置时 reg.exe 会输出「(值未设置)」/「(value not set)」占位文本，
+    // 必须当作不存在，否则会中断回退链导致误判
+    return v.startsWith('(') ? null : v
   } catch {
     return null
   }
 }
 
-/** 检测 .md 是否已默认用本应用打开：优先 UserChoice，其次 Classes\.md 默认值 */
-async function isDefaultMarkdownApp(): Promise<boolean> {
-  if (process.platform !== 'win32') return false
+/** 本应用在 Windows 上可能使用的 ProgId：安装期由 electron-builder 注册
+    「Markdown Document」，运行期一键设置注册「mkdown.md」，两者都要认，
+    否则通过系统设置选的默认应用会被误判为未默认。 */
+const MD_PROGID = 'Markdown Document'
+const MD_PROGIDS = [MD_PROGID, 'mkdown.md']
+
+function isOwnProgId(v: string | null): boolean {
+  if (v === null) return false
+  if (MD_PROGIDS.includes(v)) return true
+  // Win11 在「打开方式」里选中本应用后，UserChoice 记录的可能不是 ProgId 名，
+  // 而是 `Applications\<exe 名>` 形式，也要认，否则用户明明选过了仍被判为未默认
+  const m = v.match(/^Applications\\(.+)$/i)
+  return (
+    app.isPackaged && m !== null && m[1].toLowerCase() === basename(process.execPath).toLowerCase()
+  )
+}
+
+/** 写 HKCU 注册表字符串值（isDefault 为 true 时写子键默认值） */
+function addReg(key: string, name: string, data: string, isDefault = false): Promise<unknown> {
+  return execFileAsync(
+    'reg.exe',
+    ['add', key, ...(isDefault ? ['/ve'] : ['/v', name]), '/t', 'REG_SZ', '/d', data, '/f'],
+    { windowsHide: true }
+  )
+}
+
+/** 执行 PowerShell 脚本，只返回纯 ASCII 结果。
+    reg.exe 在中文 Windows 上输出 GBK，Node 按 UTF-8 解码会把中文路径变成乱码
+    （`Markdown笔记本.exe` → 乱码），随后 existsSync 恒为 false。
+    因此凡是需要拿到含中文的路径再比对的场景，一律在 PowerShell 内部完成，只回传 1/0。 */
+async function runPowerShell(
+  script: string,
+  env: Record<string, string> = {}
+): Promise<string> {
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', script],
+    { windowsHide: true, env: { ...process.env, ...env } }
+  )
+  return stdout.trim()
+}
+
+/** 当前生效的 .md ProgId：UserChoice → Win11 UserChoiceLatest → Classes 默认值 */
+async function effectiveProgId(): Promise<string | null> {
   const userChoice = await queryRegValue(
     'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.md\\UserChoice',
     'ProgId'
   )
-  if (userChoice) return userChoice === 'mkdown.md'
-  return (await queryRegValue('HKCU\\Software\\Classes\\.md', '')) === 'mkdown.md'
+  if (userChoice) return userChoice
+  // Win11 22H2+ 改由 UserChoiceLatest 保存同一信息：ProgId 是子键，值名也叫 ProgId
+  const latest = await queryRegValue(
+    'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.md\\UserChoiceLatest\\ProgId',
+    'ProgId'
+  )
+  if (latest) return latest
+  return queryRegValue('HKCU\\Software\\Classes\\.md', '')
+}
+
+/** ProgId 名字对得上还不够：应用换过安装目录后，注册表里会残留旧路径，
+    此时双击 .md 根本打不开，必须视为未正确关联。
+    整个校验在 PowerShell 内完成（取命令 → 提 exe → 判存在 → 比文件名），只回传 1/0，
+    避免中文安装路径经 reg.exe 的 GBK 输出被解码成乱码而恒判失败。 */
+async function progIdHealthy(progId: string): Promise<boolean> {
+  const script =
+    "$ErrorActionPreference='SilentlyContinue';" +
+    `$item=Get-Item -LiteralPath 'HKCU:\\Software\\Classes\\${progId}\\shell\\open\\command';` +
+    "if(-not $item){'0';exit};" +
+    "$c=$item.GetValue('');" +
+    "if(-not $c){'0';exit};" +
+    "$e=if($c -match '\"([^\"]+\\.exe)\"'){$Matches[1]}" +
+    "elseif($c -match '([^\\s\"]+\\.exe)'){$Matches[1]}else{''};" +
+    "if(-not $e -or -not (Test-Path -LiteralPath $e)){'0';exit};" +
+    // 开发模式下无法注册自身，只要求关联指向一个真实存在的程序
+    "if($env:MK_EXE -and ([IO.Path]::GetFileName($e) -ne $env:MK_EXE)){'0';exit};" +
+    "'1'"
+  try {
+    const out = await runPowerShell(script, {
+      MK_EXE: app.isPackaged ? basename(process.execPath) : ''
+    })
+    return out === '1'
+  } catch {
+    return false
+  }
+}
+
+/** 把自有 ProgId 的打开命令与图标修正到当前安装位置（自愈，不改用户选择的默认程序）。
+    是否已一致也交给 PowerShell 判断，避免每次窗口聚焦都因乱码而重写注册表。 */
+async function ensureOwnRegistration(): Promise<void> {
+  if (process.platform !== 'win32' || !app.isPackaged) return
+  const exePath = process.execPath
+  const command = `"${exePath}" "%1"`
+  const ids = MD_PROGIDS.map((p) => `'${p}'`).join(',')
+  const script =
+    "$ErrorActionPreference='SilentlyContinue';" +
+    `foreach($id in @(${ids})){` +
+    '$item=Get-Item -LiteralPath "HKCU:\\Software\\Classes\\$id\\shell\\open\\command";' +
+    "$c=if($item){$item.GetValue('')}else{''};" +
+    "if($c -eq $env:MK_EXPECT){'1'}else{'0'}}"
+  let flags: string[] = []
+  try {
+    flags = (await runPowerShell(script, { MK_EXPECT: command })).split(/\r?\n/)
+  } catch {
+    return
+  }
+  for (let i = 0; i < MD_PROGIDS.length; i++) {
+    if (flags[i]?.trim() === '1') continue
+    try {
+      await addReg(`HKCU\\Software\\Classes\\${MD_PROGIDS[i]}\\shell\\open\\command`, '', command, true)
+      await addReg(`HKCU\\Software\\Classes\\${MD_PROGIDS[i]}\\DefaultIcon`, '', `"${exePath}",0`, true)
+    } catch {
+      // 写入失败忽略，检测会返回未默认并引导用户到系统设置
+    }
+  }
+}
+
+/** macOS：应用 bundle id 与 Markdown 的 UTI */
+const MAC_BUNDLE_ID = 'com.mkdown.notebook'
+const MAC_MD_UTI = 'net.daringfireball.markdown'
+
+/** macOS 当前把 .md 交给哪个 bundle（无默认时返回 null），走 LaunchServices。
+    kLSRolesEditor 在 JXA 里没有可靠的常量桥接，直接用数值 4（CoreServices 定义）。 */
+async function macDefaultHandler(): Promise<string | null> {
+  const script =
+    "ObjC.import('CoreServices');" +
+    `var h = $.LSCopyDefaultRoleHandlerForContentType($('${MAC_MD_UTI}'), 4);` +
+    'h ? ObjC.unwrap(h) : ""'
+  try {
+    const { stdout } = await execFileAsync('osascript', ['-l', 'JavaScript', '-e', script], {
+      windowsHide: true
+    })
+    const v = stdout.trim()
+    return v || null
+  } catch {
+    return null
+  }
+}
+
+/** macOS 把 .md 的默认编辑器指向本应用 */
+async function setMacDefaultHandler(): Promise<boolean> {
+  const script =
+    "ObjC.import('CoreServices');" +
+    `$.LSSetDefaultRoleHandlerForContentType($('${MAC_MD_UTI}'), 4, $('${MAC_BUNDLE_ID}'));` +
+    '""'
+  try {
+    await execFileAsync('osascript', ['-l', 'JavaScript', '-e', script], { windowsHide: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 让 LaunchServices 重新登记本应用（应用刚安装/移动过时，设置默认可能因未登记而失败） */
+async function registerMacBundle(): Promise<void> {
+  const lsregister =
+    '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
+  // app.getPath('exe') 形如 …/X.app/Contents/MacOS/X，上溯三级即 .app 根目录
+  const bundlePath = resolve(app.getPath('exe'), '../../..')
+  try {
+    await execFileAsync(lsregister, ['-f', bundlePath], { windowsHide: true })
+  } catch {
+    // lsregister 不可用时忽略
+  }
+}
+
+/** 检测 .md 是否已默认用本应用打开 */
+async function isDefaultMarkdownApp(): Promise<boolean> {
+  if (process.platform === 'darwin') {
+    return (await macDefaultHandler()) === MAC_BUNDLE_ID
+  }
+  if (process.platform !== 'win32') return false
+  const progId = await effectiveProgId()
+  if (!progId || !isOwnProgId(progId)) return false
+  // 名字命中后还要确认打开命令真的指向当前应用，否则旧安装路径会让双击失效
+  return progIdHealthy(progId)
 }
 
 /** 将 .md / .markdown 的文件图标写为本应用图标并通知资源管理器刷新（尽力而为）。
     clearCache 用于显式设置默认后强制重建图标缓存；启动复查时只做轻量通知。 */
 async function refreshFileIcons(clearCache: boolean): Promise<void> {
   if (process.platform !== 'win32' || !app.isPackaged) return
-  try {
-    await execFileAsync(
-      'reg.exe',
-      [
-        'add',
-        'HKCU\\Software\\Classes\\mkdown.md\\DefaultIcon',
-        '/ve',
-        '/t',
-        'REG_SZ',
-        '/d',
-        `"${process.execPath},0"`,
-        '/f'
-      ],
-      { windowsHide: true }
-    )
-  } catch {
-    // 写入失败忽略
+  for (const progId of MD_PROGIDS) {
+    try {
+      await addReg(
+        `HKCU\\Software\\Classes\\${progId}\\DefaultIcon`,
+        '',
+        `"${process.execPath}",0`,
+        true
+      )
+    } catch {
+      // 写入失败忽略
+    }
   }
   if (clearCache) {
     try {
@@ -413,6 +587,8 @@ async function refreshFileIcons(clearCache: boolean): Promise<void> {
 /** 重新检测默认应用状态：同步菜单与所有窗口的工具栏按钮。
     每次启动 / 重复启动 / 设置成功后调用；已是默认时顺带确保文件图标指向本应用。 */
 async function refreshDefaultState(): Promise<void> {
+  // 先把可能残留的旧安装路径修正回当前运行位置，再判断是否默认
+  await ensureOwnRegistration()
   const v = await isDefaultMarkdownApp()
   if (v === defaultAppRegistered) return
   defaultAppRegistered = v
@@ -427,8 +603,36 @@ async function refreshDefaultState(): Promise<void> {
  * 再复查结果，无需用户去系统设置页手动选择。
  */
 async function setDefaultMarkdownApp(): Promise<{ ok: boolean; message: string }> {
+  if (process.platform === 'darwin') {
+    if (!app.isPackaged) {
+      return {
+        ok: false,
+        message: '开发模式没有正式的应用标识，无法注册默认应用。请使用打包后的应用设置。'
+      }
+    }
+    await registerMacBundle()
+    const called = await setMacDefaultHandler()
+    let ok = called && (await isDefaultMarkdownApp())
+    if (called && !ok) {
+      // LaunchServices 落盘有延迟，稍等后复查一次
+      await new Promise((r) => setTimeout(r, 500))
+      ok = await isDefaultMarkdownApp()
+    }
+    if (ok) {
+      defaultAppRegistered = true
+      buildMenu()
+      for (const win of BrowserWindow.getAllWindows()) sendTo(win, 'default:changed', true)
+    }
+    return ok
+      ? { ok: true, message: '设置成功：.md 文件已默认使用 Markdown笔记本 打开。' }
+      : {
+          ok: false,
+          message:
+            '未能自动设为默认。请在 Finder 中右键任一 .md 文件 → 显示简介 → 打开方式选择“Markdown笔记本”→ 点击“全部更改”。'
+        }
+  }
   if (process.platform !== 'win32') {
-    return { ok: false, message: '当前仅支持 Windows 自动注册，其他系统请在文件属性中手动选择打开方式。' }
+    return { ok: false, message: '当前系统不支持自动注册默认应用。' }
   }
   if (!app.isPackaged) {
     return {
@@ -437,46 +641,45 @@ async function setDefaultMarkdownApp(): Promise<{ ok: boolean; message: string }
     }
   }
   try {
+    // 先自愈：旧版本可能把 ProgId 的打开命令留在已删除的安装目录
+    await ensureOwnRegistration()
+
     const exePath = process.execPath
     const exeName = basename(exePath)
     const appKey = `HKCU\\Software\\Classes\\Applications\\${exeName}`
-    const progId = 'mkdown.md'
     const command = `"${exePath}" "%1"`
-    const add = (key: string, name: string, data: string, isDefault = false): Promise<unknown> =>
-      execFileAsync(
-        'reg.exe',
-        ['add', key, ...(isDefault ? ['/ve'] : ['/v', name]), '/t', 'REG_SZ', '/d', data, '/f'],
-        { windowsHide: true }
-      )
 
-    await add(`${appKey}\\shell\\open\\command`, '', command, true)
-    await add(appKey, 'FriendlyAppName', APP_NAME)
-    await add(`${appKey}\\SupportedTypes`, '.md', '')
-    await add(`${appKey}\\SupportedTypes`, '.markdown', '')
-    await add(`${appKey}\\Capabilities`, 'ApplicationName', APP_NAME)
-    await add(`${appKey}\\Capabilities`, 'ApplicationDescription', 'Markdown 笔记本：编辑与预览 Markdown 文档')
-    await add(`${appKey}\\Capabilities\\FileAssociations`, '.md', progId)
-    await add(`${appKey}\\Capabilities\\FileAssociations`, '.markdown', progId)
-    await add(`HKCU\\Software\\Classes\\${progId}`, '', 'Markdown 文档', true)
-    await add(`HKCU\\Software\\Classes\\${progId}\\DefaultIcon`, '', `"${exePath},0"`, true)
-    await add(`HKCU\\Software\\Classes\\${progId}\\shell\\open\\command`, '', command, true)
-    await add(
+    await addReg(`${appKey}\\shell\\open\\command`, '', command, true)
+    await addReg(appKey, 'FriendlyAppName', APP_NAME)
+    await addReg(`${appKey}\\SupportedTypes`, '.md', '')
+    await addReg(`${appKey}\\SupportedTypes`, '.markdown', '')
+    await addReg(`${appKey}\\Capabilities`, 'ApplicationName', APP_NAME)
+    await addReg(`${appKey}\\Capabilities`, 'ApplicationDescription', 'Markdown 笔记本：编辑与预览 Markdown 文档')
+    await addReg(`${appKey}\\Capabilities\\FileAssociations`, '.md', MD_PROGID)
+    await addReg(`${appKey}\\Capabilities\\FileAssociations`, '.markdown', MD_PROGID)
+    await addReg(`HKCU\\Software\\Classes\\${MD_PROGID}`, '', 'Markdown 文档', true)
+    await addReg(`HKCU\\Software\\Classes\\${MD_PROGID}\\DefaultIcon`, '', `"${exePath}",0`, true)
+    await addReg(`HKCU\\Software\\Classes\\${MD_PROGID}\\shell\\open\\command`, '', command, true)
+    await addReg(
       'HKCU\\Software\\RegisteredApplications',
       'mkdown',
       `Software\\Classes\\Applications\\${exeName}\\Capabilities`
     )
 
-    // 自动设为默认：清除旧 UserChoice（不存在或删除失败则忽略），再写入默认 ProgId
+    // 自动设为默认：清除旧的 UserChoice / UserChoiceLatest（不存在或删除失败则忽略），
+    // 再写入扩展默认 ProgId。Win11 22H2+ 以 UserChoiceLatest 为准，只删 UserChoice 无效。
     const fileExtsKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts'
     for (const ext of ['.md', '.markdown']) {
-      try {
-        await execFileAsync('reg.exe', ['delete', `${fileExtsKey}\\${ext}\\UserChoice`, '/f'], {
-          windowsHide: true
-        })
-      } catch {
-        // UserChoice 不存在或受保护时忽略
+      for (const sub of ['UserChoice', 'UserChoiceLatest']) {
+        try {
+          await execFileAsync('reg.exe', ['delete', `${fileExtsKey}\\${ext}\\${sub}`, '/f'], {
+            windowsHide: true
+          })
+        } catch {
+          // 子键不存在或受系统保护时忽略
+        }
       }
-      await add(`HKCU\\Software\\Classes\\${ext}`, '', progId, true)
+      await addReg(`HKCU\\Software\\Classes\\${ext}`, '', MD_PROGID, true)
     }
     // 文件图标写为本应用图标并强制刷新图标缓存
     await refreshFileIcons(true)
@@ -486,14 +689,15 @@ async function setDefaultMarkdownApp(): Promise<{ ok: boolean; message: string }
       defaultAppRegistered = true
       buildMenu()
       for (const win of BrowserWindow.getAllWindows()) sendTo(win, 'default:changed', true)
+      return { ok: true, message: '设置成功：.md / .markdown 文件已默认使用 Markdown笔记本 打开。' }
     }
-    return ok
-      ? { ok: true, message: '设置成功：.md / .markdown 文件已默认使用 Markdown笔记本 打开。' }
-      : {
-          ok: false,
-          message:
-            '未能自动设为默认应用（受系统权限限制）。请在 Windows 设置 → 应用 → 默认应用中按文件类型 .md 选择“Markdown笔记本”。'
-        }
+    // 自动写入被系统保护拦下时，直接带用户去系统「默认应用」设置页
+    void shell.openExternal('ms-settings:defaultapps')
+    return {
+      ok: false,
+      message:
+        '系统未允许自动修改（Win11 保护默认应用设置）。已打开「默认应用」设置页：搜索 “Markdown” 或找到 .md，点「设置默认值」即可。'
+    }
   } catch (err) {
     return { ok: false, message: `注册失败：${(err as Error).message}` }
   }

@@ -64,13 +64,15 @@
         "ext": "md",
         "name": "Markdown Document",
         "description": "Markdown 文档",
-        "role": "Editor"
+        "role": "Editor",
+        "mimeType": "text/markdown"
       },
       {
         "ext": "markdown",
         "name": "Markdown Document",
         "description": "Markdown 文档",
-        "role": "Editor"
+        "role": "Editor",
+        "mimeType": "text/markdown"
       }
     ],
     "win": {
