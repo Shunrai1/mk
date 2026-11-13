@@ -52,7 +52,7 @@ Electron 继承 Chromium 多进程架构：
 5. ✅ `setWindowOpenHandler` 拒绝页面内 `window.open`（应用窗口只由主进程 `createWindow` 创建）；`will-navigate` 拦截页面跳转。
 6. ✅ 外部链接交给系统浏览器（`shell.openExternal`），不在应用内打开。
 7. ✅ 单实例锁（`requestSingleInstanceLock`）：仅一个主进程，重复启动按参数聚焦或新开窗口。
-8. ⚠️ 渲染本地图片使用 `file://` 重写，生产模式（file:// 源）可用；开发模式受 webSecurity 限制。
+8. ✅ 渲染本地图片统一改写为 `mkimg://` 自定义协议（主进程读盘返回字节），开发/打包模式均可显示；`file://` 在开发模式受 webSecurity 限制，仅作为兜底解析。
 
 ## 4. IPC 契约
 
@@ -65,11 +65,13 @@ Electron 继承 Chromium 多进程架构：
 | `file:save` | invoke | 写入已命名文件 |
 | `file:save-as` | invoke | 另存为对话框 → 写入 |
 | `file:initial` | invoke | 取本窗口创建时传入的文件路径并读取内容 |
+| `image:save` | invoke | 粘贴的剪贴板位图落盘（文档旁 `assets/`，未保存文档落 `userData/pasted-images`）→ 返回 Markdown 路径 |
+| `image:import` | invoke | 粘贴/复制来的图片文件复制进同一目录，避免重新编码 |
 | `doc:state` | send | 上报脏标记与路径，主进程维护该窗口标题与关闭保护 |
 | `app:close-requested` | 主→渲染 | 有未保存内容时请求该窗口渲染器弹出保存确认 |
 | `app:force-close` | send | 用户确认后强制关闭该窗口 |
 | `app:new-window` | send | 新开一个空白窗口（工具栏「新建」） |
-| `menu:action` | 主→渲染 | 菜单/快捷键动作（open/save/save-as/view-*/set-default） |
+| `menu:action` | 主→渲染 | 菜单/快捷键动作（open/save/save-as/find/view-*/set-default） |
 | `shell:open-external` | send | 用系统浏览器打开 http(s) 链接 |
 | `app:set-default` | invoke | 一键自动设置 .md 默认打开方式（见下节） |
 | `app:get-default-state` | invoke | 检测 .md 是否已默认用本应用打开（决定是否隐藏按钮） |
@@ -142,11 +144,23 @@ node scripts/generate-icon.mjs  # 重新生成 build/icon.ico 与 icon.png
 ## 8. Markdown 渲染管线
 
 `react-markdown`（CommonMark）+ `remark-gfm`（表格/任务列表/删除线/脚注/自动链接）
-+ `remark-math` / `rehype-katex`（数学公式）+ `rehype-highlight`（代码高亮，自动检测语言，
-`plainText: ['mermaid']` 排除 mermaid 块）。mermaid 围栏代码块由 `pre` 组件拦截，
++ `remark-breaks`（单换行即换行、空行分段）+ `remark-math` / `rehype-katex`（数学公式）
++ `rehype-highlight`（代码高亮，自动检测语言，`plainText: ['mermaid']` 排除 mermaid 块）。
+原始 HTML（如从网页/Word 复制的 `<table>`）先由 `rehype-raw` 解析为真实节点，
+再经 `rehype-sanitize`（GitHub 风格默认 schema + 少量放行）过滤 `<script>`、事件属性与危险协议；
+schema 需注意两点：`clobberPrefix: ''`（脚注 id 已由 remark 加过前缀，重复加会导致锚点失效），
+以及同一属性的候选值必须写在同一条规则里（sanitize 只取第一条 className 规则）——
+`code` 放行 `math-inline/math-display`（公式节点是 `<code class="language-math ...">`）、
+`h2` 放行 `footnotes-title`。`rehype-sanitize` 必须排在 katex/highlight 之前，
+否则它们生成的 class 会被一并清掉。mermaid 围栏代码块由 `pre` 组件拦截，
 交给 `mermaid.render` 生成 SVG（300ms 防抖、`securityLevel: 'strict'`、唯一 id）；
 语法错误时显示错误提示并保留上一次成功图形；在编辑器中修改代码块即实时重渲染。
-预览中的链接点击交给系统浏览器；相对路径图片重写为基于文档目录的 `file://` 地址。
+预览中的链接点击交给系统浏览器；本地图片（相对路径、绝对路径、`file://`）统一改写为
+`mkimg://img/?p=<绝对路径>`，由主进程校验存在性后读盘返回，开发模式也能显示。编辑器内粘贴图片
+（剪贴板位图或资源管理器复制的图片文件）会先落盘到文档旁 `assets/`，再于光标处插入 `![](assets/...)`；
+文档未保存时落到 `userData/pasted-images` 并插入绝对路径。纯预览模式下粘贴则追加到文末。
+连续空行会被 CommonMark 折叠成一个段落间隔，`remarkBlankLines` 按源码行号在顶层块之间
+插入 `<div class="md-blank">` 占位块（每个多出的空行一块，CSS 高度 `1lh`）还原留白。
 
 脚注（GFM）：`remarkRehypeOptions` 把区块标题汉化为「脚注」（`footnotes-title`，默认为隐藏的 `sr-only`）、
 返回链接 aria-label 设为「返回正文」。注意两点：一是只有正文中出现真实 `[^x]` 引用才会生成脚注区块，
@@ -180,6 +194,7 @@ node scripts/generate-icon.mjs  # 重新生成 build/icon.ico 与 icon.png
 - 开发模式（electron 未打包）不执行默认应用注册，按钮会提示使用安装版。
 - 开发模式下任务栏「最近」项点击后可能无法正确启动应用（系统按 AUMID 拉起的是
   electron.exe 而非应用入口），应用内「打开」下拉不受影响；打包安装后正常。
-- 开发模式下文档内相对路径本地图片可能不显示（webSecurity），打包后正常。
+- ~~开发模式下文档内相对路径本地图片可能不显示（webSecurity）~~：现已改走 `mkimg://` 协议，
+  开发与打包模式都能显示；仅当页面被外部地址接管（非同源 iframe）时才可能受限。
 - 若旧 UserChoice 受系统保护无法删除，自动默认设置会失败，
   需用户在 Windows 设置 → 默认应用中手动选择一次（兜底路径）。

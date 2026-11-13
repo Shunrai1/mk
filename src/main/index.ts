@@ -4,14 +4,15 @@ import {
   dialog,
   ipcMain,
   Menu,
+  protocol,
   shell,
   type BaseWindow,
   type IpcMainInvokeEvent,
   type MenuItemConstructorOptions
 } from 'electron'
-import { basename, join, resolve } from 'path'
+import { basename, dirname, join, resolve } from 'path'
 import { existsSync, readFileSync } from 'fs'
-import { readFile, writeFile } from 'fs/promises'
+import { copyFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { autoUpdater } from 'electron-updater'
@@ -19,11 +20,37 @@ import { autoUpdater } from 'electron-updater'
 const execFileAsync = promisify(execFile)
 
 const MD_EXT = /\.(md|markdown|mdown|mkd)$/i
+
+// 预览中的本地图片走自定义协议：开发模式页面源是 http://localhost，
+// file:// 图片会被 webSecurity 拦截；mkimg:// 由主进程读盘返回字节，开发/打包均可用
+const IMAGE_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+  avif: 'image/avif'
+}
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'mkimg', privileges: { standard: true, secure: true, supportFetchAPI: true } }
+])
+
 const APP_NAME = 'Markdown笔记本'
 const APP_USER_MODEL_ID = 'com.mkdown.notebook'
 const NEW_WINDOW_FLAG = '--new-window'
-/** 开发模式图标：打包后由 exe 自带图标，无需指定 */
-const DEV_ICON = join(app.getAppPath(), 'build', 'icon.ico')
+
+// 开发模式与安装版隔离：独立应用名与 userData，
+// 单实例锁（按 userData 路径区分）和本地配置互不干扰，两者可同时运行
+if (!app.isPackaged) {
+  app.setName(`${app.getName()}-dev`)
+  app.setPath('userData', join(app.getPath('appData'), app.getName()))
+}
+
+/** 窗口标题：开发模式加标记，便于与安装版区分 */
+const WINDOW_TITLE = app.isPackaged ? APP_NAME : `${APP_NAME}（开发）`
 
 /** 每个窗口独立维护文档状态，互不影响 */
 type WindowState = {
@@ -77,10 +104,97 @@ function removeRecentFile(filePath: string): void {
   }
 }
 
+/** 主题：持久化到 userData，全部窗口共享；菜单单选与窗口背景色同步 */
+type Theme = 'light' | 'dark' | 'grid'
+const THEMES: readonly Theme[] = ['light', 'dark', 'grid']
+const THEME_BG: Record<Theme, string> = { light: '#f5f6f8', dark: '#13161c', grid: '#fdf8e2' }
+const themeStorePath = join(app.getPath('userData'), 'theme.json')
+let currentTheme: Theme = 'light'
+
+function loadTheme(): void {
+  try {
+    const data: unknown = JSON.parse(readFileSync(themeStorePath, 'utf-8'))
+    const t = (data as { theme?: unknown } | null)?.theme
+    if (typeof t === 'string' && (THEMES as readonly string[]).includes(t)) currentTheme = t as Theme
+  } catch {
+    currentTheme = 'light'
+  }
+}
+
+function applyTheme(theme: Theme): void {
+  if (!THEMES.includes(theme) || theme === currentTheme) return
+  currentTheme = theme
+  void writeFile(themeStorePath, JSON.stringify({ theme }), 'utf-8').catch(() => {})
+  buildMenu()
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    win.setBackgroundColor(THEME_BG[theme])
+    sendTo(win, 'theme:changed', theme)
+  }
+}
+
 type FileResult =
   | { ok: true; path: string; content: string }
   | { ok: false; canceled?: boolean; error?: string }
 type SaveResult = { ok: true; path: string } | { ok: false; canceled?: boolean; error?: string }
+type ImageSaveResult =
+  | { ok: true; path: string; absolutePath: string }
+  | { ok: false; error: string }
+
+/** 图片扩展名（不在白名单内的一律拒绝写入） */
+function imageExtOf(name: string): string | null {
+  const ext = name.split('.').pop()?.toLowerCase() ?? ''
+  return IMAGE_MIME[ext] ? ext : null
+}
+
+function uniqueImageName(ext: string): string {
+  const d = new Date()
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  return `image-${stamp}-${Math.random().toString(36).slice(2, 6)}.${ext}`
+}
+
+/** 粘贴的图片落到文档旁 assets/ 目录；文档尚未保存时落到 userData/pasted-images */
+async function storeImage(
+  docPath: string | null,
+  ext: string,
+  write: (dest: string) => Promise<void>
+): Promise<ImageSaveResult> {
+  const relative = docPath !== null
+  const dir = relative
+    ? join(dirname(docPath), 'assets')
+    : join(app.getPath('userData'), 'pasted-images')
+  await mkdir(dir, { recursive: true })
+  const fileName = uniqueImageName(ext)
+  const absolutePath = join(dir, fileName)
+  await write(absolutePath)
+  return {
+    ok: true,
+    path: relative ? `assets/${fileName}` : absolutePath.replace(/\\/g, '/'),
+    absolutePath
+  }
+}
+
+function registerImageProtocol(): void {
+  protocol.handle('mkimg', async (request) => {
+    try {
+      const raw = new URL(request.url).searchParams.get('p')
+      if (!raw) return new Response('Bad Request', { status: 400 })
+      const filePath = resolve(raw)
+      if (!existsSync(filePath)) return new Response('Not Found', { status: 404 })
+      // 只允许图片扩展名，避免该协议被用来读取任意文件
+      const ext = imageExtOf(filePath)
+      if (!ext) return new Response('Forbidden', { status: 403 })
+      const data = await readFile(filePath)
+      const mime = IMAGE_MIME[ext] ?? 'application/octet-stream'
+      return new Response(new Uint8Array(data), { headers: { 'content-type': mime } })
+    } catch {
+      return new Response('Internal Error', { status: 500 })
+    }
+  })
+}
 
 function fileFromArgv(argv: string[]): string | null {
   for (const arg of argv) {
@@ -125,7 +239,7 @@ function updateTitle(win: BrowserWindow): void {
   const state = windowStates.get(win.id)
   if (!state) return
   const name = state.docPath ? basename(state.docPath) : '未命名'
-  win.setTitle(`${name}${state.docDirty ? ' ●' : ''} - ${APP_NAME}`)
+  win.setTitle(`${name}${state.docDirty ? ' ●' : ''} - ${WINDOW_TITLE}`)
 }
 
 function createWindow(filePath: string | null = null): BrowserWindow {
@@ -134,9 +248,8 @@ function createWindow(filePath: string | null = null): BrowserWindow {
     height: 800,
     minWidth: 760,
     minHeight: 480,
-    title: APP_NAME,
-    icon: app.isPackaged ? undefined : DEV_ICON,
-    backgroundColor: '#f5f6f8',
+    title: WINDOW_TITLE,
+    backgroundColor: THEME_BG[currentTheme],
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -177,10 +290,13 @@ function createWindow(filePath: string | null = null): BrowserWindow {
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   win.webContents.on('will-navigate', (e) => e.preventDefault())
 
+  // 主题经 query 传入，渲染器首帧即可应用，避免加载闪烁
   if (process.env.ELECTRON_RENDERER_URL) {
-    win.loadURL(process.env.ELECTRON_RENDERER_URL)
+    const url = new URL(process.env.ELECTRON_RENDERER_URL)
+    url.searchParams.set('theme', currentTheme)
+    win.loadURL(url.toString())
   } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'))
+    win.loadFile(join(__dirname, '../renderer/index.html'), { query: { theme: currentTheme } })
   }
   return win
 }
@@ -211,7 +327,7 @@ function registerUserTasks(): void {
       arguments: app.isPackaged
         ? NEW_WINDOW_FLAG
         : `"${app.getAppPath()}" ${NEW_WINDOW_FLAG}`,
-      iconPath: app.isPackaged ? process.execPath : DEV_ICON,
+      iconPath: process.execPath,
       iconIndex: 0,
       title: '新建窗口',
       description: '打开一个空白的 Markdown 窗口'
@@ -245,6 +361,64 @@ async function isDefaultMarkdownApp(): Promise<boolean> {
   )
   if (userChoice) return userChoice === 'mkdown.md'
   return (await queryRegValue('HKCU\\Software\\Classes\\.md', '')) === 'mkdown.md'
+}
+
+/** 将 .md / .markdown 的文件图标写为本应用图标并通知资源管理器刷新（尽力而为）。
+    clearCache 用于显式设置默认后强制重建图标缓存；启动复查时只做轻量通知。 */
+async function refreshFileIcons(clearCache: boolean): Promise<void> {
+  if (process.platform !== 'win32' || !app.isPackaged) return
+  try {
+    await execFileAsync(
+      'reg.exe',
+      [
+        'add',
+        'HKCU\\Software\\Classes\\mkdown.md\\DefaultIcon',
+        '/ve',
+        '/t',
+        'REG_SZ',
+        '/d',
+        `"${process.execPath},0"`,
+        '/f'
+      ],
+      { windowsHide: true }
+    )
+  } catch {
+    // 写入失败忽略
+  }
+  if (clearCache) {
+    try {
+      await execFileAsync('ie4uinit.exe', ['-ClearIconCache'], { windowsHide: true })
+    } catch {
+      // 忽略
+    }
+  }
+  try {
+    await execFileAsync('ie4uinit.exe', ['-show'], { windowsHide: true })
+  } catch {
+    // 忽略
+  }
+  // SHCNE_ASSOCCHANGED：通知 shell 文件关联已变化，资源管理器据此重读文件图标
+  const notify =
+    "Add-Type -Namespace Win32 -Name Shell -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);'; " +
+    '[Win32.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)'
+  try {
+    await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', notify], {
+      windowsHide: true
+    })
+  } catch {
+    // 忽略
+  }
+}
+
+/** 重新检测默认应用状态：同步菜单与所有窗口的工具栏按钮。
+    每次启动 / 重复启动 / 设置成功后调用；已是默认时顺带确保文件图标指向本应用。 */
+async function refreshDefaultState(): Promise<void> {
+  const v = await isDefaultMarkdownApp()
+  if (v === defaultAppRegistered) return
+  defaultAppRegistered = v
+  buildMenu()
+  for (const win of BrowserWindow.getAllWindows()) sendTo(win, 'default:changed', v)
+  if (v) void refreshFileIcons(false)
 }
 
 /**
@@ -304,17 +478,14 @@ async function setDefaultMarkdownApp(): Promise<{ ok: boolean; message: string }
       }
       await add(`HKCU\\Software\\Classes\\${ext}`, '', progId, true)
     }
-    // 通知资源管理器刷新文件图标（尽力而为）
-    try {
-      await execFileAsync('ie4uinit.exe', ['-show'], { windowsHide: true })
-    } catch {
-      // 刷新失败忽略
-    }
+    // 文件图标写为本应用图标并强制刷新图标缓存
+    await refreshFileIcons(true)
 
     const ok = await isDefaultMarkdownApp()
     if (ok) {
       defaultAppRegistered = true
       buildMenu()
+      for (const win of BrowserWindow.getAllWindows()) sendTo(win, 'default:changed', true)
     }
     return ok
       ? { ok: true, message: '设置成功：.md / .markdown 文件已默认使用 Markdown笔记本 打开。' }
@@ -379,6 +550,83 @@ function setupAutoUpdater(): void {
   setTimeout(() => {
     void checkForUpdates().catch(() => {})
   }, 5000)
+}
+
+/** 检查更新并用原生对话框展示结果：菜单点击与渲染进程 IPC 共用同一套流程 */
+async function checkForUpdatesWithDialog(win: BrowserWindow | null): Promise<UpdateCheckResponse> {
+  const showBox = (opts: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> =>
+    win && !win.isDestroyed() ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)
+
+  if (!app.isPackaged) {
+    await showBox({
+      type: 'info',
+      title: '检查更新',
+      message: '开发模式不支持检查更新',
+      detail: '请使用安装版应用检查更新。',
+      buttons: ['确定'],
+      noLink: true
+    })
+    return { ok: false, message: '开发模式不支持检查更新，请使用安装版。' }
+  }
+
+  try {
+    // 网络异常时不无限等待，超时后给出原生提示
+    const result = await Promise.race([
+      checkForUpdates(),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('timeout')), 20000)
+      })
+    ])
+    const version = result?.updateInfo.version
+    if (version && version !== app.getVersion()) {
+      const { response } = await showBox({
+        type: 'info',
+        title: '检查更新',
+        message: `发现新版本 v${version}`,
+        detail: `当前版本 v${app.getVersion()}。是否现在下载并安装？`,
+        buttons: ['立即更新', '稍后'],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true
+      })
+      if (response === 0) {
+        void autoUpdater.downloadUpdate().catch((err) => {
+          void showBox({
+            type: 'error',
+            title: '下载更新失败',
+            message: '下载更新失败',
+            detail: (err as Error).message,
+            buttons: ['确定'],
+            noLink: true
+          })
+        })
+      }
+      return { ok: true, status: 'available', version }
+    }
+    await showBox({
+      type: 'info',
+      title: '检查更新',
+      message: '当前已是最新版本',
+      detail: `当前版本 v${app.getVersion()}。`,
+      buttons: ['确定'],
+      noLink: true
+    })
+    return { ok: true, status: 'not-available' }
+  } catch (err) {
+    const message =
+      (err as Error).message === 'timeout'
+        ? '检查超时，请检查网络连接后重试。'
+        : (err as Error).message
+    await showBox({
+      type: 'error',
+      title: '检查更新失败',
+      message: '检查更新失败',
+      detail: message,
+      buttons: ['确定'],
+      noLink: true
+    })
+    return { ok: false, message }
+  }
 }
 
 function registerIpc(): void {
@@ -447,6 +695,49 @@ function registerIpc(): void {
     }
   )
 
+  // 剪贴板图片：渲染器传原始字节，主进程按扩展名落盘并返回 Markdown 可用路径
+  ipcMain.handle(
+    'image:save',
+    async (
+      _e,
+      payload: { data?: unknown; ext?: unknown; docPath?: unknown }
+    ): Promise<ImageSaveResult> => {
+      try {
+        const ext = String(payload?.ext ?? 'png').toLowerCase()
+        if (!IMAGE_MIME[ext]) return { ok: false, error: '不支持的图片格式' }
+        const data = payload?.data
+        const bytes =
+          data instanceof ArrayBuffer
+            ? new Uint8Array(data)
+            : data instanceof Uint8Array
+              ? data
+              : null
+        if (!bytes || bytes.byteLength === 0) return { ok: false, error: '剪贴板中没有图片数据' }
+        const docPath = typeof payload?.docPath === 'string' ? payload.docPath : null
+        return await storeImage(docPath, ext, (dest) => writeFile(dest, bytes))
+      } catch (err) {
+        return { ok: false, error: (err as Error).message }
+      }
+    }
+  )
+
+  // 从资源管理器复制来的图片文件：直接复制原文件，避免重新编码
+  ipcMain.handle(
+    'image:import',
+    async (_e, payload: { sourcePath?: unknown; docPath?: unknown }): Promise<ImageSaveResult> => {
+      try {
+        const sourcePath = typeof payload?.sourcePath === 'string' ? payload.sourcePath : ''
+        if (!sourcePath || !existsSync(sourcePath)) return { ok: false, error: '图片文件不存在' }
+        const ext = imageExtOf(sourcePath)
+        if (!ext) return { ok: false, error: '不支持的图片格式' }
+        const docPath = typeof payload?.docPath === 'string' ? payload.docPath : null
+        return await storeImage(docPath, ext, (dest) => copyFile(sourcePath, dest))
+      } catch (err) {
+        return { ok: false, error: (err as Error).message }
+      }
+    }
+  )
+
   ipcMain.handle('file:initial', async (e): Promise<FileResult | null> => {
     const win = windowOf(e)
     const state = win ? windowStates.get(win.id) : undefined
@@ -489,6 +780,9 @@ function registerIpc(): void {
   ipcMain.handle('app:set-default', () => setDefaultMarkdownApp())
   ipcMain.handle('app:get-default-state', () => isDefaultMarkdownApp())
 
+  ipcMain.handle('theme:get', (): Theme => currentTheme)
+  ipcMain.on('theme:set', (_e, theme: Theme) => applyTheme(theme))
+
   ipcMain.handle('recent:list', (): string[] => [...recentFiles])
 
   ipcMain.handle('recent:remove', (_e, filePath: string) => {
@@ -503,17 +797,7 @@ function registerIpc(): void {
 
   ipcMain.handle('update:get-state', (): UpdateEvent => updateState)
 
-  ipcMain.handle('update:check', async (): Promise<UpdateCheckResponse> => {
-    if (!app.isPackaged) return { ok: false, message: '开发模式不支持检查更新，请使用安装版。' }
-    try {
-      const result = await checkForUpdates()
-      const version = result?.updateInfo.version
-      if (version && version !== app.getVersion()) return { ok: true, status: 'available', version }
-      return { ok: true, status: 'not-available' }
-    } catch (err) {
-      return { ok: false, message: (err as Error).message }
-    }
-  })
+  ipcMain.handle('update:check', (e) => checkForUpdatesWithDialog(windowOf(e)))
 
   ipcMain.handle('update:download', async (): Promise<{ ok: boolean; message?: string }> => {
     try {
@@ -569,7 +853,13 @@ function buildMenu(): void {
         { role: 'cut', label: '剪切' },
         { role: 'copy', label: '复制' },
         { role: 'paste', label: '粘贴' },
-        { role: 'selectAll', label: '全选' }
+        { role: 'selectAll', label: '全选' },
+        { type: 'separator' },
+        {
+          label: '查找…',
+          accelerator: 'CmdOrCtrl+F',
+          click: (_item, win) => sendTo(menuTarget(win), 'menu:action', 'find')
+        }
       ]
     },
     {
@@ -589,6 +879,30 @@ function buildMenu(): void {
           label: '预览模式',
           accelerator: 'CmdOrCtrl+3',
           click: (_item, win) => sendTo(menuTarget(win), 'menu:action', 'view-preview')
+        },
+        { type: 'separator' },
+        {
+          label: '主题',
+          submenu: [
+            {
+              label: '明亮',
+              type: 'radio',
+              checked: currentTheme === 'light',
+              click: () => applyTheme('light')
+            },
+            {
+              label: '暗黑',
+              type: 'radio',
+              checked: currentTheme === 'dark',
+              click: () => applyTheme('dark')
+            },
+            {
+              label: '网格（浅黄方格纸）',
+              type: 'radio',
+              checked: currentTheme === 'grid',
+              click: () => applyTheme('grid')
+            }
+          ]
         },
         { type: 'separator' },
         { role: 'reload', label: '重新加载' },
@@ -622,7 +936,10 @@ function buildMenu(): void {
         },
         {
           label: '检查更新…',
-          click: (_item, win) => sendTo(menuTarget(win), 'menu:action', 'check-update')
+          click: (_item, win) => {
+            // 直接在主进程检查并弹原生对话框，避免开发模式等场景下渲染进程链路失效
+            void checkForUpdatesWithDialog(menuTarget(win))
+          }
         },
         {
           label: '关于',
@@ -644,8 +961,8 @@ function buildMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-// Windows 任务栏分组与跳转列表需要稳定的 AppUserModelId
-app.setAppUserModelId(APP_USER_MODEL_ID)
+// Windows 任务栏分组与跳转列表需要稳定的 AppUserModelId；开发模式用独立身份，避免与安装版合并分组
+app.setAppUserModelId(app.isPackaged ? APP_USER_MODEL_ID : `${APP_USER_MODEL_ID}-dev`)
 
 const gotTheLock = app.requestSingleInstanceLock()
 if (!gotTheLock) {
@@ -653,6 +970,8 @@ if (!gotTheLock) {
 } else {
   // 单进程多窗口：重复启动不再抢占已有窗口，按需新开窗口
   app.on('second-instance', (_e, argv) => {
+    // 重复启动也视为一次「启动」：重新检测默认应用状态
+    void refreshDefaultState()
     if (argv.includes(NEW_WINDOW_FLAG)) {
       createWindow()
       return
@@ -675,17 +994,14 @@ if (!gotTheLock) {
 
   app.whenReady().then(() => {
     loadRecentFiles()
+    loadTheme()
     registerIpc()
+    registerImageProtocol()
     buildMenu()
     registerUserTasks()
     setupAutoUpdater()
     createWindow(earlyOpenPath ?? fileFromArgv(process.argv))
-    void isDefaultMarkdownApp().then((v) => {
-      if (v !== defaultAppRegistered) {
-        defaultAppRegistered = v
-        buildMenu()
-      }
-    })
+    void refreshDefaultState()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })

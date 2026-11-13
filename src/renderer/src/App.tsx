@@ -1,12 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import CodeMirror from '@uiw/react-codemirror'
+import CodeMirror, { EditorState, type EditorView } from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
+import { openSearchPanel, search } from '@codemirror/search'
 import { Preview } from './Preview'
-import type { UpdateEvent } from '../../preload'
+import { Toc } from './Toc'
+import type { ImageSaveResult, Theme, UpdateEvent } from '../../preload'
 
 type ViewMode = 'edit' | 'split' | 'preview'
 
+// 主进程经 URL query 传入当前主题，模块加载时立即应用，避免首帧闪烁
+const queryTheme = new URLSearchParams(window.location.search).get('theme')
+const initialTheme: Theme = queryTheme === 'dark' || queryTheme === 'grid' ? queryTheme : 'light'
+document.documentElement.dataset.theme = initialTheme
+
 const MD_FILE_RE = /\.(md|markdown|mdown|mkd)$/i
+const SYNC_STORE_KEY = 'mkdown.sync-scroll'
+
+// 剪贴板图片 MIME → 落盘扩展名
+const IMAGE_EXT_BY_MIME: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+  'image/svg+xml': 'svg',
+  'image/avif': 'avif'
+}
+const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i
 
 function baseName(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
@@ -27,6 +47,8 @@ const WELCOME = [
   '- `Ctrl + O` 打开 `.md` 文件，也可以直接把文件拖进窗口',
   '- `Ctrl + S` 保存，`Ctrl + Shift + S` 另存为',
   '- `Ctrl + 1 / 2 / 3` 切换 编辑 / 分屏 / 预览 模式',
+  '- `Ctrl + F` 查找（编辑区与预览区均支持）',
+  '- 菜单「视图 → 主题」可切换 明亮 / 暗黑 / 网格 三种主题',
   '',
   '## 支持的语法',
   '',
@@ -70,7 +92,7 @@ const WELCOME = [
   '  B --> D[渲染图表与公式]',
   '```',
   '',
-  '> 提示：点击工具栏右侧「设为 .md 默认应用」可一键将本应用设为 Markdown 文件的默认打开方式（安装版），设置成功后按钮自动隐藏。',
+  '> 提示：菜单「帮助 → 设为 Markdown 默认应用」可一键将本应用设为 Markdown 文件的默认打开方式（安装版）。',
   '',
   '[^1]: 这是一个脚注。',
   '[^2]: 第二个脚注，编号按正文中首次引用的顺序排列。',
@@ -99,7 +121,10 @@ const ICONS = {
   plus: 'M12 5v14M5 12h14',
   folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
   save: 'M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2zM17 21v-8H7v8M7 3v5h8',
-  chevronDown: 'M6 9l6 6 6-6'
+  chevronDown: 'M6 9l6 6 6-6',
+  chevronUp: 'M18 15l-6-6-6 6',
+  close: 'M18 6L6 18M6 6l12 12',
+  sync: 'M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4'
 }
 
 export default function App() {
@@ -107,10 +132,17 @@ export default function App() {
   const [savedContent, setSavedContent] = useState(WELCOME)
   const [filePath, setFilePath] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('split')
+  const [syncScroll, setSyncScroll] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SYNC_STORE_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+  const [theme, setTheme] = useState<Theme>(initialTheme)
   const [status, setStatus] = useState('就绪')
   const [busy, setBusy] = useState(false)
   const [closeDialogOpen, setCloseDialogOpen] = useState(false)
-  const [showDefaultButton, setShowDefaultButton] = useState(false)
   const [recentOpen, setRecentOpen] = useState(false)
   const [recentFiles, setRecentFiles] = useState<string[]>([])
   const recentRef = useRef<HTMLDivElement>(null)
@@ -118,13 +150,112 @@ export default function App() {
   const [updateDismissed, setUpdateDismissed] = useState(false)
   const [updateBusy, setUpdateBusy] = useState(false)
 
+  // Ctrl+F 查找：编辑区用 CodeMirror 搜索面板，预览区用自定义查找条
+  const cmViewRef = useRef<EditorView | null>(null)
+  const activePaneRef = useRef<'editor' | 'preview'>('editor')
+  const previewInputRef = useRef<HTMLInputElement>(null)
+  const previewScrollRef = useRef<HTMLDivElement>(null)
+  const previewRootRef = useRef<HTMLDivElement>(null)
+  const [previewSearchOpen, setPreviewSearchOpen] = useState(false)
+  const [previewQuery, setPreviewQuery] = useState('')
+  const [previewCase, setPreviewCase] = useState(false)
+  const [previewIndex, setPreviewIndex] = useState(0)
+  const [previewCount, setPreviewCount] = useState(0)
+
   const dirty = content !== savedContent
+
+  // 主题：主进程为唯一来源（持久化 + 多窗口同步），本地即时应用保证反馈
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+  }, [theme])
+
+  useEffect(() => {
+    let mounted = true
+    void window.api.getTheme().then((t) => {
+      if (mounted) setTheme(t)
+    })
+    const off = window.api.onThemeChanged(setTheme)
+    return () => {
+      mounted = false
+      off()
+    }
+  }, [])
+
+  // 同步滚动偏好持久化
+  useEffect(() => {
+    try {
+      localStorage.setItem(SYNC_STORE_KEY, syncScroll ? '1' : '0')
+    } catch {
+      // 隐私模式等写入失败时忽略，仅影响偏好记忆
+    }
+  }, [syncScroll])
+
+  // 分屏同步滚动：编辑区与预览区按滚动比例双向联动。
+  // 程序写入的目标位置会被记录下来，用于过滤自身触发的 scroll 事件，避免两边互相追逐。
+  useEffect(() => {
+    if (viewMode !== 'split' || !syncScroll) return
+    const editor = cmViewRef.current?.scrollDOM
+    const preview = previewScrollRef.current
+    if (!editor || !preview) return
+
+    const programmatic = { editor: Number.NaN, preview: Number.NaN }
+    const ratioOf = (el: HTMLElement): number => {
+      const max = el.scrollHeight - el.clientHeight
+      return max > 0 ? el.scrollTop / max : 0
+    }
+    const apply = (el: HTMLElement, ratio: number): number => {
+      const max = el.scrollHeight - el.clientHeight
+      el.scrollTop = Math.max(0, Math.min(max, ratio * max))
+      return el.scrollTop
+    }
+
+    const onEditorScroll = (): void => {
+      if (editor.scrollTop === programmatic.editor) return
+      programmatic.preview = apply(preview, ratioOf(editor))
+    }
+    const onPreviewScroll = (): void => {
+      if (preview.scrollTop === programmatic.preview) return
+      programmatic.editor = apply(editor, ratioOf(preview))
+    }
+
+    editor.addEventListener('scroll', onEditorScroll, { passive: true })
+    preview.addEventListener('scroll', onPreviewScroll, { passive: true })
+    // 开启开关或进入分屏时，先把预览对齐到编辑区当前位置
+    programmatic.preview = apply(preview, ratioOf(editor))
+    return () => {
+      editor.removeEventListener('scroll', onEditorScroll)
+      preview.removeEventListener('scroll', onPreviewScroll)
+    }
+  }, [viewMode, syncScroll])
 
   // 事件回调中读取最新状态，避免闭包过期
   const stateRef = useRef({ content, filePath, dirty })
   stateRef.current = { content, filePath, dirty }
 
-  const cmExtensions = useMemo(() => [markdown()], [])
+  const cmExtensions = useMemo(
+    () => [
+      markdown(),
+      search({ top: true }),
+      EditorState.phrases.of({
+        Find: '查找',
+        Replace: '替换',
+        next: '下一个',
+        previous: '上一个',
+        all: '全选',
+        'match case': '区分大小写',
+        regexp: '正则',
+        'by word': '全词匹配',
+        replace: '替换',
+        'replace all': '全部替换',
+        close: '关闭',
+        'current match': '当前匹配',
+        'on line': '位于行',
+        'replaced $ matches': '已替换 $ 处匹配',
+        'replaced match on line $': '已替换第 $ 行的匹配'
+      })
+    ],
+    []
+  )
 
   const loadDocument = useCallback((path: string, text: string) => {
     setContent(text)
@@ -135,6 +266,22 @@ export default function App() {
 
   const confirmDiscard = useCallback((message: string): boolean => {
     return !stateRef.current.dirty || window.confirm(message)
+  }, [])
+
+  // 在编辑器光标处插入 Markdown；编辑器未挂载（纯预览模式）时追加到文末
+  const insertMarkdown = useCallback((text: string): void => {
+    const view = cmViewRef.current
+    if (view && view.dom.isConnected) {
+      const { from, to } = view.state.selection.main
+      view.dispatch({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        scrollIntoView: true
+      })
+      view.focus()
+      return
+    }
+    setContent((prev) => `${prev}${prev && !prev.endsWith('\n') ? '\n' : ''}${text}`)
   }, [])
 
   const doSave = useCallback(async (): Promise<boolean> => {
@@ -237,26 +384,60 @@ export default function App() {
     }
   }, [recentOpen])
 
-  const setDefault = useCallback(async (): Promise<void> => {
-    const result = await window.api.setDefaultApp()
-    setStatus(result.message)
-    if (result.ok) {
-      setShowDefaultButton(!(await window.api.getDefaultState()))
+  // Ctrl+F：按当前视图与最近交互的窗格决定搜索目标（分屏时跟随焦点所在窗格）
+  const openFind = useCallback((): void => {
+    const target =
+      viewMode === 'preview' ? 'preview' : viewMode === 'edit' ? 'editor' : activePaneRef.current
+    if (target === 'editor' && cmViewRef.current) {
+      cmViewRef.current.focus()
+      openSearchPanel(cmViewRef.current)
     } else {
-      window.alert(result.message)
+      setPreviewSearchOpen(true)
     }
+  }, [viewMode])
+
+  const closePreviewSearch = useCallback((): void => {
+    setPreviewSearchOpen(false)
   }, [])
 
-  const doCheckUpdate = useCallback(async (): Promise<void> => {
-    setStatus('正在检查更新…')
-    const result = await window.api.checkUpdate()
-    if (!result.ok) setStatus(`检查更新失败：${result.message}`)
-    else if (result.status === 'not-available') setStatus('当前已是最新版本')
-    else setStatus(`发现新版本 v${result.version}`)
-  }, [])
+  const stepPreviewMatch = useCallback(
+    (delta: number): void => {
+      if (previewCount === 0) return
+      setPreviewIndex((i) => (i + delta + previewCount) % previewCount)
+    },
+    [previewCount]
+  )
+
+  // 打开预览查找条时聚焦并选中输入框
+  useEffect(() => {
+    if (previewSearchOpen) {
+      previewInputRef.current?.focus()
+      previewInputRef.current?.select()
+    }
+  }, [previewSearchOpen])
+
+  // 文档变化导致匹配数变化时，收敛当前匹配序号
+  useEffect(() => {
+    setPreviewIndex((i) => (previewCount === 0 ? 0 : Math.min(i, previewCount - 1)))
+  }, [previewCount])
+
+  // 键盘兜底：菜单快捷键未拦截时仍能触发查找；Esc 关闭预览查找条
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        openFind()
+      } else if (e.key === 'Escape' && previewSearchOpen && !cmViewRef.current?.hasFocus) {
+        closePreviewSearch()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [openFind, previewSearchOpen, closePreviewSearch])
 
   const doDownloadUpdate = useCallback(async (): Promise<void> => {
     setUpdateBusy(true)
+    setStatus('正在下载更新…')
     const result = await window.api.downloadUpdate()
     setUpdateBusy(false)
     if (!result.ok) setStatus(`下载更新失败：${result.message ?? '未知错误'}`)
@@ -274,6 +455,9 @@ export default function App() {
         case 'save-as':
           void doSaveAs()
           break
+        case 'find':
+          openFind()
+          break
         case 'view-edit':
           setViewMode('edit')
           break
@@ -283,15 +467,9 @@ export default function App() {
         case 'view-preview':
           setViewMode('preview')
           break
-        case 'set-default':
-          void setDefault()
-          break
-        case 'check-update':
-          void doCheckUpdate()
-          break
       }
     },
-    [doOpen, doSave, doSaveAs, setDefault, doCheckUpdate]
+    [doOpen, doSave, doSaveAs, openFind]
   )
 
   // 订阅主进程事件 + 读取启动时传入的文件
@@ -301,7 +479,6 @@ export default function App() {
     void window.api.getInitialFile().then((r) => {
       if (r && r.ok) loadDocument(r.path, r.content)
     })
-    void window.api.getDefaultState().then((isDefault) => setShowDefaultButton(!isDefault))
     return () => {
       offMenu()
       offClose()
@@ -344,6 +521,67 @@ export default function App() {
       window.removeEventListener('drop', onDrop)
     }
   }, [openExternalPath])
+
+  // 粘贴图片：剪贴板里的位图或图片文件先落盘，再在光标处插入 Markdown 图片语法。
+  // 用捕获阶段监听，避免 CodeMirror 先按纯文本处理；普通文本粘贴不受影响。
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent): void => {
+      const data = e.clipboardData
+      if (!data) return
+      const files: File[] = []
+      for (const item of Array.from(data.items)) {
+        if (item.kind !== 'file') continue
+        const file = item.getAsFile()
+        if (file && (file.type.startsWith('image/') || IMAGE_FILE_RE.test(file.name))) {
+          files.push(file)
+        }
+      }
+      if (files.length === 0) return
+      e.preventDefault()
+      e.stopPropagation()
+
+      void (async () => {
+        try {
+          const docPath = stateRef.current.filePath
+          const marks: string[] = []
+          let failed = 0
+          for (const file of files) {
+            const ext =
+              IMAGE_EXT_BY_MIME[file.type] ?? file.name.split('.').pop()?.toLowerCase() ?? 'png'
+            let source = ''
+            try {
+              source = window.api.getPathForFile(file)
+            } catch {
+              source = ''
+            }
+            // 资源管理器复制来的文件优先直接复制；失败（如临时文件无扩展名）再回退到字节写入
+            let result: ImageSaveResult | null = source
+              ? await window.api.importImageFile(source, docPath)
+              : null
+            if (!result || !result.ok) {
+              result = await window.api.savePastedImage(await file.arrayBuffer(), ext, docPath)
+            }
+            if (result.ok) marks.push(`![粘贴的图片](${result.path})`)
+            else failed += 1
+          }
+          if (marks.length > 0) {
+            insertMarkdown(marks.join('\n'))
+            setStatus(
+              docPath
+                ? `已插入 ${marks.length} 张图片，保存在文档旁的 assets 目录${failed ? `（${failed} 张失败）` : ''}`
+                : `已插入 ${marks.length} 张图片，暂存于应用数据目录，建议先保存文档${failed ? `（${failed} 张失败）` : ''}`
+            )
+          } else {
+            setStatus('插入图片失败：无法读取剪贴板中的图片')
+          }
+        } catch (err) {
+          setStatus(`插入图片失败：${(err as Error).message}`)
+        }
+      })()
+    }
+    window.addEventListener('paste', onPaste, true)
+    return () => window.removeEventListener('paste', onPaste, true)
+  }, [insertMarkdown])
 
   const closeAndSave = async (): Promise<void> => {
     const ok = await doSave()
@@ -433,27 +671,40 @@ export default function App() {
             </button>
           ))}
         </div>
-        <div className="toolbar-group toolbar-right">
-          {showDefaultButton && (
+        {viewMode === 'split' && (
+          <div className="toolbar-group">
             <button
-              className="ghost"
-              onClick={() => void setDefault()}
-              title="一键将本应用设为 .md 文件的默认打开方式"
+              className={`sync-toggle${syncScroll ? ' active' : ''}`}
+              aria-pressed={syncScroll}
+              title={
+                syncScroll
+                  ? '关闭同步滚动'
+                  : '开启同步滚动：编辑区与预览区按相同比例一起滚动'
+              }
+              onClick={() => setSyncScroll((v) => !v)}
             >
-              设为 .md 默认应用
+              <Icon d={ICONS.sync} />
+              <span>同步滚动</span>
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </header>
 
       <main className={`workspace mode-${viewMode}`}>
         {viewMode !== 'preview' && (
-          <section className="pane editor-pane" aria-label="Markdown 编辑器">
+          <section
+            className="pane editor-pane"
+            aria-label="Markdown 编辑器"
+            onMouseDownCapture={() => (activePaneRef.current = 'editor')}
+            onFocusCapture={() => (activePaneRef.current = 'editor')}
+          >
             <CodeMirror
               value={content}
               height="100%"
+              theme={theme === 'dark' ? 'dark' : 'light'}
               extensions={cmExtensions}
               onChange={(v) => setContent(v)}
+              onCreateEditor={(view) => (cmViewRef.current = view)}
               placeholder="开始输入 Markdown…"
               basicSetup={{
                 lineNumbers: true,
@@ -465,8 +716,86 @@ export default function App() {
           </section>
         )}
         {viewMode !== 'edit' && (
-          <section className="pane preview-pane" aria-label="Markdown 预览">
-            <Preview content={content} filePath={filePath} />
+          <section
+            className="pane preview-pane"
+            aria-label="Markdown 预览"
+            onMouseDownCapture={() => (activePaneRef.current = 'preview')}
+            onFocusCapture={() => (activePaneRef.current = 'preview')}
+          >
+            <div className="preview-main">
+              {previewSearchOpen && (
+                <div className="preview-search-bar" role="search" aria-label="在预览中查找">
+                  <input
+                    ref={previewInputRef}
+                    value={previewQuery}
+                    placeholder="在预览中查找"
+                    aria-label="查找内容"
+                    onChange={(e) => {
+                      setPreviewQuery(e.target.value)
+                      setPreviewIndex(0)
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        stepPreviewMatch(e.shiftKey ? -1 : 1)
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault()
+                        closePreviewSearch()
+                      }
+                    }}
+                  />
+                  <span className="preview-search-count" aria-live="polite">
+                    {previewQuery
+                      ? previewCount > 0
+                        ? `${Math.min(previewIndex + 1, previewCount)}/${previewCount}`
+                        : '无结果'
+                      : ''}
+                  </span>
+                  <button
+                    className={`case-toggle${previewCase ? ' active' : ''}`}
+                    title="区分大小写"
+                    aria-pressed={previewCase}
+                    onClick={() => {
+                      setPreviewCase((v) => !v)
+                      setPreviewIndex(0)
+                    }}
+                  >
+                    Aa
+                  </button>
+                  <button
+                    title="上一个 (Shift+Enter)"
+                    onClick={() => stepPreviewMatch(-1)}
+                    disabled={previewCount === 0}
+                  >
+                    <Icon d={ICONS.chevronUp} />
+                  </button>
+                  <button
+                    title="下一个 (Enter)"
+                    onClick={() => stepPreviewMatch(1)}
+                    disabled={previewCount === 0}
+                  >
+                    <Icon d={ICONS.chevronDown} />
+                  </button>
+                  <button title="关闭 (Esc)" onClick={closePreviewSearch}>
+                    <Icon d={ICONS.close} />
+                  </button>
+                </div>
+              )}
+              <div className="preview-scroll" ref={previewScrollRef}>
+                <Preview
+                  content={content}
+                  filePath={filePath}
+                  rootRef={previewRootRef}
+                  theme={theme}
+                  searchActive={previewSearchOpen}
+                  searchQuery={previewQuery}
+                  searchCaseSensitive={previewCase}
+                  searchIndex={previewIndex}
+                  onSearchCount={setPreviewCount}
+                />
+              </div>
+            </div>
+            <Toc content={content} rootRef={previewRootRef} scrollRef={previewScrollRef} />
           </section>
         )}
       </main>
@@ -511,12 +840,17 @@ export default function App() {
       )}
 
       <footer className="statusbar">
-        <span className="status-path" title={filePath ?? undefined}>
+        <span
+          className="status-path"
+          title={filePath ? `${filePath}（当前打开的 Markdown 文件）` : '尚未保存到文件，按 Ctrl+S 可保存'}
+        >
           {filePath ?? '未命名文档'}
           {dirty && <span className="dirty-flag"> ● 未保存</span>}
         </span>
-        <span className="status-message">{status}</span>
-        <span className="status-meta">
+        <span className="status-message" title="操作状态提示：打开、保存、检查更新等结果会显示在这里">
+          {status}
+        </span>
+        <span className="status-meta" title="当前文档的字符数与行数">
           {content.length} 字符 · {content.split('\n').length} 行 · Markdown
         </span>
       </footer>
