@@ -1,5 +1,6 @@
+/** 管理 Markdown 笔记本的编辑、预览、文件操作和窗口内交互。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import CodeMirror, { EditorState, type EditorView } from '@uiw/react-codemirror'
+import CodeMirror, { EditorState, type EditorView, type ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
 import { openSearchPanel, search } from '@codemirror/search'
 import { Preview } from './Preview'
@@ -128,6 +129,7 @@ const ICONS = {
   check: 'M20 6L9 17l-5-5'
 }
 
+/** 渲染笔记本窗口并管理当前文档与视图状态。 */
 export default function App() {
   const [content, setContent] = useState(WELCOME)
   const [savedContent, setSavedContent] = useState(WELCOME)
@@ -153,6 +155,7 @@ export default function App() {
 
   // Ctrl+F 查找：编辑区用 CodeMirror 搜索面板，预览区用自定义查找条
   const cmViewRef = useRef<EditorView | null>(null)
+  const [editorScroll, setEditorScroll] = useState<HTMLElement | null>(null)
   const activePaneRef = useRef<'editor' | 'preview'>('editor')
   const previewInputRef = useRef<HTMLInputElement>(null)
   const previewScrollRef = useRef<HTMLDivElement>(null)
@@ -164,6 +167,13 @@ export default function App() {
   const [previewCount, setPreviewCount] = useState(0)
 
   const dirty = content !== savedContent
+
+  /** 在编辑器就绪或卸载时更新实例引用与滚动容器。 */
+  const bindEditor = useCallback((instance: ReactCodeMirrorRef | null): void => {
+    const view = instance?.view ?? null
+    cmViewRef.current = view
+    setEditorScroll(view?.scrollDOM ?? null)
+  }, [])
 
   // 主题：主进程为唯一来源（持久化 + 多窗口同步），本地即时应用保证反馈
   useEffect(() => {
@@ -195,25 +205,29 @@ export default function App() {
   // 程序写入的目标位置会被记录下来，用于过滤自身触发的 scroll 事件，避免两边互相追逐。
   useEffect(() => {
     if (viewMode !== 'split' || !syncScroll) return
-    const editor = cmViewRef.current?.scrollDOM
+    const editor = editorScroll
     const preview = previewScrollRef.current
     if (!editor || !preview) return
 
     const programmatic = { editor: Number.NaN, preview: Number.NaN }
+    /** 计算容器当前滚动位置在可滚动范围内的比例。 */
     const ratioOf = (el: HTMLElement): number => {
       const max = el.scrollHeight - el.clientHeight
       return max > 0 ? el.scrollTop / max : 0
     }
+    /** 按比例设置目标容器的滚动位置，并返回浏览器实际采用的位置。 */
     const apply = (el: HTMLElement, ratio: number): number => {
       const max = el.scrollHeight - el.clientHeight
       el.scrollTop = Math.max(0, Math.min(max, ratio * max))
       return el.scrollTop
     }
 
+    /** 将编辑区的滚动进度同步到预览区。 */
     const onEditorScroll = (): void => {
       if (editor.scrollTop === programmatic.editor) return
       programmatic.preview = apply(preview, ratioOf(editor))
     }
+    /** 将预览区的滚动进度同步到编辑区。 */
     const onPreviewScroll = (): void => {
       if (preview.scrollTop === programmatic.preview) return
       programmatic.editor = apply(editor, ratioOf(preview))
@@ -227,7 +241,7 @@ export default function App() {
       editor.removeEventListener('scroll', onEditorScroll)
       preview.removeEventListener('scroll', onPreviewScroll)
     }
-  }, [viewMode, syncScroll])
+  }, [viewMode, syncScroll, editorScroll])
 
   // 事件回调中读取最新状态，避免闭包过期
   const stateRef = useRef({ content, filePath, dirty })
@@ -700,12 +714,12 @@ export default function App() {
             onFocusCapture={() => (activePaneRef.current = 'editor')}
           >
             <CodeMirror
+              ref={bindEditor}
               value={content}
               height="100%"
               theme={theme === 'dark' ? 'dark' : 'light'}
               extensions={cmExtensions}
               onChange={(v) => setContent(v)}
-              onCreateEditor={(view) => (cmViewRef.current = view)}
               placeholder="开始输入 Markdown…"
               basicSetup={{
                 lineNumbers: true,
