@@ -1,6 +1,6 @@
 {
   "name": "mk",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Markdown 笔记本：打开、编辑、渲染、保存 Markdown 文件，并可设为 .md 默认打开方式",
   "main": "./out/main/index.js",
   "author": "Shunrai",
