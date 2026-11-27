@@ -1,3 +1,4 @@
+/** 设置应用主题、编辑器、Markdown 预览及窗口控件的布局和样式。 */
 /* ---------- 主题变量 ----------
    明亮（默认）/ 暗黑 / 网格（浅黄方格纸）。
    主进程经 URL query 与 theme:changed 事件设置 <html data-theme>。 */
@@ -1012,6 +1013,53 @@ body {
 
 .markdown-body h3 {
   font-size: 1.25em;
+}
+
+.markdown-body :where(.md-section) {
+  margin-block-start: 1.4em;
+}
+
+.markdown-body .md-section > summary {
+  position: relative;
+  display: flow-root;
+  list-style: none;
+  cursor: pointer;
+}
+
+.markdown-body .md-section > summary::before {
+  content: '';
+  position: absolute;
+  top: 0.72em;
+  left: -20px;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  color: var(--accent);
+  opacity: 0;
+  transform: rotate(-45deg);
+}
+
+.markdown-body .md-section[open] > summary::before {
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.markdown-body .md-section > summary:hover::before {
+  opacity: 1;
+}
+
+.markdown-body .md-section > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.markdown-body .md-section > summary > :is(h1, h2, h3, h4, h5, h6) {
+  margin-top: 0;
+}
+
+.markdown-body .md-section:not([open]) > .md-section-content {
+  display: none;
 }
 
 .markdown-body p {

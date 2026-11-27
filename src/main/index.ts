@@ -1,3 +1,4 @@
+/** 管理 Electron 窗口、系统集成及主进程文件操作。 */
 import {
   app,
   BrowserWindow,
@@ -10,8 +11,8 @@ import {
   type IpcMainInvokeEvent,
   type MenuItemConstructorOptions
 } from 'electron'
-import { basename, dirname, join, resolve } from 'path'
-import { existsSync, readFileSync } from 'fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'path'
+import { existsSync, readFileSync, unwatchFile, watchFile } from 'fs'
 import { copyFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -57,6 +58,7 @@ type WindowState = {
   allowClose: boolean
   docDirty: boolean
   docPath: string | null
+  stopWatching?: () => void
   initialFilePath: string | null
 }
 
@@ -71,6 +73,7 @@ const RECENT_DOCS_SUPPORTED = process.platform === 'win32' || process.platform =
 const recentStorePath = join(app.getPath('userData'), 'recent-files.json')
 let recentFiles: string[] = []
 
+/** 载入仍然存在的最近文件。 */
 function loadRecentFiles(): void {
   try {
     const data: unknown = JSON.parse(readFileSync(recentStorePath, 'utf-8'))
@@ -82,10 +85,12 @@ function loadRecentFiles(): void {
   }
 }
 
+/** 将最近文件列表写入应用数据目录。 */
 function saveRecentFiles(): void {
   void writeFile(recentStorePath, JSON.stringify(recentFiles), 'utf-8').catch(() => {})
 }
 
+/** 将打开或另存的文件加入最近列表。 */
 function recordRecentFile(filePath: string): void {
   const p = resolve(filePath)
   recentFiles = [p, ...recentFiles.filter((x) => x !== p)].slice(0, MAX_RECENT_FILES)
@@ -93,6 +98,7 @@ function recordRecentFile(filePath: string): void {
   if (RECENT_DOCS_SUPPORTED) app.addRecentDocument(p)
 }
 
+/** 从最近列表移除指定文件。 */
 function removeRecentFile(filePath: string): void {
   if (!recentFiles.includes(filePath)) return
   recentFiles = recentFiles.filter((p) => p !== filePath)
@@ -111,6 +117,7 @@ const THEME_BG: Record<Theme, string> = { light: '#f5f6f8', dark: '#13161c', gri
 const themeStorePath = join(app.getPath('userData'), 'theme.json')
 let currentTheme: Theme = 'light'
 
+/** 载入持久化的主题设置。 */
 function loadTheme(): void {
   try {
     const data: unknown = JSON.parse(readFileSync(themeStorePath, 'utf-8'))
@@ -121,6 +128,7 @@ function loadTheme(): void {
   }
 }
 
+/** 更新所有窗口的主题并保存偏好。 */
 function applyTheme(theme: Theme): void {
   if (!THEMES.includes(theme) || theme === currentTheme) return
   currentTheme = theme
@@ -141,14 +149,16 @@ type ImageSaveResult =
   | { ok: true; path: string; absolutePath: string }
   | { ok: false; error: string }
 
-/** 图片扩展名（不在白名单内的一律拒绝写入） */
+/** 提取可导入的图片扩展名。 */
 function imageExtOf(name: string): string | null {
   const ext = name.split('.').pop()?.toLowerCase() ?? ''
   return IMAGE_MIME[ext] ? ext : null
 }
 
+/** 生成用于粘贴图片的唯一文件名。 */
 function uniqueImageName(ext: string): string {
   const d = new Date()
+  /** 将日期或时间字段补齐到两位。 */
   const pad = (n: number): string => String(n).padStart(2, '0')
   const stamp =
     `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
@@ -177,6 +187,7 @@ async function storeImage(
   }
 }
 
+/** 注册用于预览本地图片的自定义协议。 */
 function registerImageProtocol(): void {
   protocol.handle('mkimg', async (request) => {
     try {
@@ -196,6 +207,7 @@ function registerImageProtocol(): void {
   })
 }
 
+/** 从启动参数中找出已有的 Markdown 文件。 */
 function fileFromArgv(argv: string[]): string | null {
   for (const arg of argv) {
     if (!arg || arg.startsWith('-')) continue
@@ -204,13 +216,28 @@ function fileFromArgv(argv: string[]): string | null {
   return null
 }
 
-async function readDocument(filePath: string): Promise<{ path: string; content: string }> {
+/** 读取 UTF-8 文档并去除开头的字节顺序标记。 */
+async function readDocumentContent(filePath: string): Promise<string> {
   const raw = await readFile(filePath, 'utf-8')
-  const content = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw
+  return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw
+}
+
+/** 打开文档并更新最近文件记录。 */
+async function readDocument(filePath: string): Promise<{ path: string; content: string }> {
+  const content = await readDocumentContent(filePath)
   recordRecentFile(filePath)
   return { path: filePath, content }
 }
 
+/** 轮询当前文档的路径，从而在外部编辑器替换文件后继续监听。 */
+function watchDocument(win: BrowserWindow, filePath: string): () => void {
+  /** 通知所属窗口重新读取当前文档。 */
+  const onChange = (): void => sendTo(win, 'file:changed', filePath)
+  watchFile(filePath, { interval: 500, persistent: false }, onChange)
+  return () => unwatchFile(filePath, onChange)
+}
+
+/** 向仍然打开的窗口发送 IPC 事件。 */
 function sendTo(win: BrowserWindow | null, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) win.webContents.send(channel, ...args)
 }
@@ -235,6 +262,7 @@ function menuTarget(win?: BaseWindow): BrowserWindow | null {
   return (win ? BrowserWindow.fromId(win.id) : null) ?? activeWindow()
 }
 
+/** 用当前文件名和未保存标记更新窗口标题。 */
 function updateTitle(win: BrowserWindow): void {
   const state = windowStates.get(win.id)
   if (!state) return
@@ -242,6 +270,7 @@ function updateTitle(win: BrowserWindow): void {
   win.setTitle(`${name}${state.docDirty ? ' ●' : ''} - ${WINDOW_TITLE}`)
 }
 
+/** 创建笔记窗口，并在关闭时释放窗口状态。 */
 function createWindow(filePath: string | null = null): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -289,6 +318,7 @@ function createWindow(filePath: string | null = null): BrowserWindow {
     }
   })
   win.on('closed', () => {
+    windowStates.get(win.id)?.stopWatching?.()
     windowStates.delete(win.id)
     if (lastFocusedWindow === win) lastFocusedWindow = null
   })
@@ -308,6 +338,7 @@ function createWindow(filePath: string | null = null): BrowserWindow {
   return win
 }
 
+/** 恢复最小化窗口并将焦点移到该窗口。 */
 function focusWindow(win: BrowserWindow): void {
   if (win.isMinimized()) win.restore()
   win.focus()
@@ -758,6 +789,7 @@ function setupAutoUpdater(): void {
 
 /** 检查更新并用原生对话框展示结果：菜单点击与渲染进程 IPC 共用同一套流程 */
 async function checkForUpdatesWithDialog(win: BrowserWindow | null): Promise<UpdateCheckResponse> {
+  /** 优先将更新对话框附在发起检查的窗口上。 */
   const showBox = (opts: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> =>
     win && !win.isDestroyed() ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)
 
@@ -833,6 +865,7 @@ async function checkForUpdatesWithDialog(win: BrowserWindow | null): Promise<Upd
   }
 }
 
+/** 注册窗口、文件和系统操作的 IPC 通道。 */
 function registerIpc(): void {
   ipcMain.handle('file:open', async (e): Promise<FileResult> => {
     const win = windowOf(e)
@@ -866,14 +899,38 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('file:save', async (_e, filePath: string, content: string): Promise<SaveResult> => {
+  ipcMain.handle('file:reload', async (e, filePath: string): Promise<FileResult> => {
+    const win = windowOf(e)
+    if (!win || typeof filePath !== 'string' || windowStates.get(win.id)?.docPath !== filePath) {
+      return { ok: false, error: '当前文档已切换' }
+    }
     try {
-      await writeFile(filePath, content, 'utf-8')
-      return { ok: true, path: filePath }
+      return { ok: true, path: filePath, content: await readDocumentContent(filePath) }
     } catch (err) {
       return { ok: false, error: (err as Error).message }
     }
   })
+
+  ipcMain.handle(
+    'file:save',
+    async (_e, filePath: string, content: string, savedContent: string): Promise<SaveResult> => {
+      try {
+        let diskContent: string | undefined
+        try {
+          diskContent = await readDocumentContent(filePath)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+        }
+        if (diskContent !== undefined && diskContent !== savedContent && diskContent !== content) {
+          return { ok: false, error: '文件已在外部修改，请刷新或另存为' }
+        }
+        if (diskContent !== content) await writeFile(filePath, content, 'utf-8')
+        return { ok: true, path: filePath }
+      } catch (err) {
+        return { ok: false, error: (err as Error).message }
+      }
+    }
+  )
 
   ipcMain.handle(
     'file:save-as',
@@ -959,7 +1016,12 @@ function registerIpc(): void {
     const current = win ? windowStates.get(win.id) : undefined
     if (!win || !current) return
     current.docDirty = Boolean(state?.dirty)
-    current.docPath = typeof state?.path === 'string' ? state.path : null
+    const path = typeof state?.path === 'string' && isAbsolute(state.path) ? state.path : null
+    if (path !== current.docPath) {
+      current.stopWatching?.()
+      current.docPath = path
+      current.stopWatching = path ? watchDocument(win, path) : undefined
+    }
     updateTitle(win)
   })
 
@@ -1017,6 +1079,7 @@ function registerIpc(): void {
   })
 }
 
+/** 构建应用菜单和窗口快捷键。 */
 function buildMenu(): void {
   const template: MenuItemConstructorOptions[] = [
     {

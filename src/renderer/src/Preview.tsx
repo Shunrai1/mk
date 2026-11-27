@@ -1,3 +1,4 @@
+/** 渲染 Markdown 预览，处理标题折叠、页内锚点和查找高亮。 */
 import {
   isValidElement,
   useEffect,
@@ -16,6 +17,7 @@ import rehypeHighlight from 'rehype-highlight'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import type { Schema } from 'hast-util-sanitize'
+import type { Element as HtmlElement, Root as HtmlRoot } from 'hast'
 import type { Root, RootContent } from 'mdast'
 import mermaid, { type MermaidConfig } from 'mermaid'
 import 'katex/dist/katex.min.css'
@@ -68,8 +70,7 @@ const SANITIZE_SCHEMA: Schema = {
   }
 }
 
-// Markdown 会把连续空行折叠成一个段落间隔。这里按源码行号在顶层块之间
-// 插入等高占位块（每多出的一个空行插一个），让手写的多行空白体现为留白。
+/** 在 Markdown 顶层块之间插入等高占位块，保留连续空行。 */
 function remarkBlankLines(): (tree: Root) => void {
   return (tree) => {
     const children = tree.children
@@ -89,15 +90,85 @@ function remarkBlankLines(): (tree: Root) => void {
   }
 }
 
+const HEADING_CONTAINERS = new Set([
+  'article', 'aside', 'blockquote', 'div', 'li', 'main', 'ol', 'section', 'ul'
+])
+
+/** 按标题层级分组，章节延续到下一个同级或更高层级的标题。 */
+function foldHeadingSections(children: HtmlElement['children']): HtmlElement['children'] {
+  const output: HtmlElement['children'] = []
+  const sections: { heading: HtmlElement; level: number; body: HtmlElement['children'] }[] = []
+
+  /** 将已读完的章节追加到上级，保留无正文的标题。 */
+  const finishSection = (): void => {
+    const section = sections.pop()!
+    const parent = sections.at(-1)?.body ?? output
+    const { heading, body } = section
+    if (body.every((node) => node.type === 'text' && !node.value.trim())) {
+      parent.push(heading, ...body)
+      return
+    }
+    parent.push({
+      type: 'element',
+      tagName: 'details',
+      properties: { className: ['md-section'], open: true },
+      children: [
+        { type: 'element', tagName: 'summary', properties: {}, children: [heading] },
+        { type: 'element', tagName: 'div', properties: { className: ['md-section-content'] }, children: body }
+      ]
+    })
+  }
+
+  for (const node of children) {
+    if (node.type === 'element') {
+      // 脚注位于整篇文档末尾，独立于最后一节。
+      if ('dataFootnotes' in node.properties) {
+        while (sections.length) finishSection()
+        output.push(node)
+        continue
+      }
+      if (HEADING_CONTAINERS.has(node.tagName)) node.children = foldHeadingSections(node.children)
+      if (/^h[1-6]$/.test(node.tagName)) {
+        const level = Number(node.tagName[1])
+        while ((sections.at(-1)?.level ?? 0) >= level) finishSection()
+        sections.push({ heading: node, level, body: [] })
+        continue
+      }
+    }
+    const parent = sections.at(-1)?.body ?? output
+    parent.push(node)
+  }
+  while (sections.length) finishSection()
+  return output
+}
+
+/** 为经过清理的 HTML 生成预览章节。 */
+function rehypeHeadingSections(): (tree: HtmlRoot) => void {
+  return (tree) => {
+    tree.children = foldHeadingSections(tree.children.filter((node) => node.type !== 'doctype'))
+  }
+}
+
 let mermaidSeq = 0
 
-// 递归提取代码块原始文本（不受高亮 span 影响）
+/** 递归提取 React 节点中的文本。 */
 function nodeText(node: ReactNode): string {
   if (node == null || typeof node === 'boolean') return ''
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(nodeText).join('')
   if (isValidElement(node)) return nodeText((node.props as { children?: ReactNode }).children)
   return ''
+}
+
+/** 标题文本变化时重建折叠控件，避免沿用原位置上其他章节的状态。 */
+const renderDetails: NonNullable<Components['details']> = ({ node, children, ...props }) => {
+  const summary = Array.isArray(children) ? children[0] : children
+  const key = props.className === 'md-section' ? nodeText(summary) : undefined
+  return (
+    <details key={key} {...props}>
+      {children}
+    </details>
+  )
 }
 
 /** mermaid 代码块 → SVG；编辑时 300ms 防抖重渲染，语法错误保留上一次成功图形；
@@ -147,8 +218,7 @@ function MermaidBlock({ code, theme }: { code: string; theme: Theme }) {
   )
 }
 
-// 相对/绝对本地路径 → mkimg:// 自定义协议（主进程读盘返回字节）。
-// 相比 file://：开发模式页面源是 http://localhost，file:// 图片会被 webSecurity 拦截。
+/** 将文件 URL 转为系统路径，并兼容 Windows 盘符。 */
 function fileUrlToPath(src: string): string {
   try {
     const p = decodeURIComponent(new URL(src).pathname)
@@ -159,6 +229,7 @@ function fileUrlToPath(src: string): string {
   }
 }
 
+/** 将本地图片路径转换为主进程可读取的 mkimg 地址。 */
 function resolveImageSrc(src: string | undefined, filePath: string | null): string | undefined {
   if (!src) return src
   if (/^(https?:|data:|blob:)/i.test(src)) return src
@@ -181,6 +252,16 @@ function resolveImageSrc(src: string | undefined, filePath: string | null): stri
 
 let flashTimer = 0
 
+/** 展开遮挡目标的章节，保留目标自身标题的折叠状态。 */
+export function revealFoldedSections(target: Element | null): void {
+  const selector = 'details.md-section'
+  let section = target?.closest<HTMLDetailsElement>(selector)
+  while (section) {
+    if (!section.firstElementChild?.contains(target)) section.open = true
+    section = section.parentElement?.closest<HTMLDetailsElement>(selector)
+  }
+}
+
 /** 短暂高亮锚点目标（不滚动），目录跳转与脚注共用 */
 export function flashAnchor(root: HTMLElement | null, id: string): void {
   const target = root?.querySelector<HTMLElement>(`#${CSS.escape(id)}`)
@@ -197,10 +278,12 @@ export function flashAnchor(root: HTMLElement | null, id: string): void {
 export function jumpToAnchor(root: HTMLElement | null, id: string): void {
   const target = root?.querySelector<HTMLElement>(`#${CSS.escape(id)}`)
   if (!target) return
+  revealFoldedSections(target)
   target.scrollIntoView({ block: 'center' })
   flashAnchor(root, id)
 }
 
+/** 显示当前文档并支持查找折叠章节中的文字。 */
 export function Preview({
   content,
   filePath,
@@ -225,7 +308,9 @@ export function Preview({
   const rangesRef = useRef<Range[]>([])
   const components = useMemo<Components>(
     () => ({
+      details: renderDetails,
       // node 是 react-markdown 注入的 hast 节点，必须剔除，否则会被当成 DOM 属性渲染出去
+      /** 将外部链接交给浏览器，页内锚点留在预览中。 */
       a({ node, href, children, ...props }) {
         return (
           <a
@@ -242,6 +327,7 @@ export function Preview({
           </a>
         )
       },
+      /** 按当前文档的路径解析图片地址。 */
       img({ node, src, alt, ...props }) {
         return (
           <img
@@ -252,6 +338,7 @@ export function Preview({
           />
         )
       },
+      /** 将 Mermaid 围栏交给图表渲染组件。 */
       pre({ children }) {
         const child = Array.isArray(children) ? children[0] : children
         if (isValidElement(child)) {
@@ -297,7 +384,7 @@ export function Preview({
     rangesRef.current = ranges
     CSS.highlights.set('preview-search', new Highlight(...ranges))
     onSearchCount(ranges.length)
-  }, [content, searchActive, searchQuery, searchCaseSensitive, onSearchCount])
+  }, [content, filePath, theme, searchActive, searchQuery, searchCaseSensitive, onSearchCount])
 
   // 当前匹配：单独一层更深的高亮，并在超出可视区域时滚动到视野中央
   useEffect(() => {
@@ -307,6 +394,7 @@ export function Preview({
       return
     }
     CSS.highlights.set('preview-search-current', new Highlight(range))
+    revealFoldedSections(range.startContainer.parentElement)
     // 滚动容器是外层 .preview-scroll（.markdown-body 本身不滚动）
     const scroller = rootRef.current?.parentElement
     if (!scroller) return
@@ -315,7 +403,7 @@ export function Preview({
     if (rect.top < view.top + 56 || rect.bottom > view.bottom - 24) {
       scroller.scrollTop += rect.top - view.top - (view.height - rect.height) / 2
     }
-  }, [content, searchActive, searchQuery, searchCaseSensitive, searchIndex])
+  }, [content, filePath, theme, searchActive, searchQuery, searchCaseSensitive, searchIndex])
 
   // 卸载（切到纯编辑模式）时清掉高亮注册
   useEffect(
@@ -329,10 +417,12 @@ export function Preview({
   return (
     <div className="markdown-body" ref={rootRef}>
       <ReactMarkdown
+        key={filePath}
         remarkPlugins={[remarkGfm, remarkMath, remarkBreaks, remarkBlankLines]}
         rehypePlugins={[
           rehypeRaw,
           [rehypeSanitize, SANITIZE_SCHEMA],
+          rehypeHeadingSections,
           rehypeKatex,
           [rehypeHighlight, { detect: true, plainText: ['mermaid'] }]
         ]}

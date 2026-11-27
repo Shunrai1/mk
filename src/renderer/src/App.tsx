@@ -29,10 +29,12 @@ const IMAGE_EXT_BY_MIME: Record<string, string> = {
 }
 const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i
 
+/** 提取 Windows 或 POSIX 路径中的文件名。 */
 function baseName(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
 }
 
+/** 提取最近文件路径的目录部分。 */
 function dirName(p: string): string {
   const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
   return i > 0 ? p.slice(0, i) : ''
@@ -64,7 +66,7 @@ const WELCOME = [
   '',
   '- [x] CommonMark 标准语法',
   '- [x] GitHub Flavored Markdown',
-  '- [ ] 试着在左侧编辑这一行',
+  '- [ ] 切换到编辑模式试着修改这一行',
   '',
   '脚注示例：点击上标[^1]会跳到文末脚注，再点脚注末尾的 ↩ 可以跳回来；同一篇文档支持多个脚注[^2]。',
   '',
@@ -100,6 +102,7 @@ const WELCOME = [
   ''
 ].join('\n')
 
+/** 渲染工具栏按钮使用的装饰图标。 */
 function Icon({ d }: { d: string }) {
   return (
     <svg
@@ -122,6 +125,7 @@ const ICONS = {
   plus: 'M12 5v14M5 12h14',
   folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
   save: 'M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2zM17 21v-8H7v8M7 3v5h8',
+  refresh: 'M20 7v5h-5M4 17v-5h5M5.5 8a7 7 0 0 1 11.6-2L20 12M4 12l2.9 6a7 7 0 0 0 11.6-2',
   chevronDown: 'M6 9l6 6 6-6',
   chevronUp: 'M18 15l-6-6-6 6',
   close: 'M18 6L6 18M6 6l12 12',
@@ -134,7 +138,7 @@ export default function App() {
   const [content, setContent] = useState(WELCOME)
   const [savedContent, setSavedContent] = useState(WELCOME)
   const [filePath, setFilePath] = useState<string | null>(null)
-  const [viewMode, setViewMode] = useState<ViewMode>('split')
+  const [viewMode, setViewMode] = useState<ViewMode>('preview')
   const [syncScroll, setSyncScroll] = useState<boolean>(() => {
     try {
       return localStorage.getItem(SYNC_STORE_KEY) === '1'
@@ -145,6 +149,8 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme)
   const [status, setStatus] = useState('就绪')
   const [busy, setBusy] = useState(false)
+  const savingRef = useRef(false)
+  const reloadRef = useRef<{ manual: boolean } | null>(null)
   const [closeDialogOpen, setCloseDialogOpen] = useState(false)
   const [recentOpen, setRecentOpen] = useState(false)
   const [recentFiles, setRecentFiles] = useState<string[]>([])
@@ -244,8 +250,8 @@ export default function App() {
   }, [viewMode, syncScroll, editorScroll])
 
   // 事件回调中读取最新状态，避免闭包过期
-  const stateRef = useRef({ content, filePath, dirty })
-  stateRef.current = { content, filePath, dirty }
+  const stateRef = useRef({ content, savedContent, filePath, dirty })
+  stateRef.current = { content, savedContent, filePath, dirty }
 
   const cmExtensions = useMemo(
     () => [
@@ -272,18 +278,21 @@ export default function App() {
     []
   )
 
+  /** 打开文档并丢弃上一个文档尚未完成的刷新请求。 */
   const loadDocument = useCallback((path: string, text: string) => {
+    reloadRef.current = null
     setContent(text)
     setSavedContent(text)
     setFilePath(path)
     setStatus(`已打开 ${baseName(path)}`)
   }, [])
 
+  /** 有未保存编辑时确认是否丢弃。 */
   const confirmDiscard = useCallback((message: string): boolean => {
     return !stateRef.current.dirty || window.confirm(message)
   }, [])
 
-  // 在编辑器光标处插入 Markdown；编辑器未挂载（纯预览模式）时追加到文末
+  /** 在编辑器光标处插入 Markdown，纯预览模式下追加到文末。 */
   const insertMarkdown = useCallback((text: string): void => {
     const view = cmViewRef.current
     if (view && view.dom.isConnected) {
@@ -299,59 +308,55 @@ export default function App() {
     setContent((prev) => `${prev}${prev && !prev.endsWith('\n') ? '\n' : ''}${text}`)
   }, [])
 
-  const doSave = useCallback(async (): Promise<boolean> => {
-    const { content: text, filePath: p } = stateRef.current
+  /** 保存当前文档的快照，同时使先前发出的刷新请求失效。 */
+  const saveDocument = useCallback(async (saveAs = false): Promise<boolean> => {
+    if (savingRef.current) return false
+    const { content: text, savedContent: baseline, filePath: p } = stateRef.current
+    savingRef.current = true
+    reloadRef.current = null
     setBusy(true)
     try {
-      const result = p
-        ? await window.api.saveFile(p, text)
-        : await window.api.saveFileAs(text)
+      const result =
+        p && !saveAs
+          ? await window.api.saveFile(p, text, baseline)
+          : await window.api.saveFileAs(text, p ?? undefined)
       if (result.ok) {
         setFilePath(result.path)
         setSavedContent(text)
-        setStatus(`已保存 · ${new Date().toLocaleTimeString()}`)
-        return true
+        setStatus(
+          saveAs ? `已另存为 ${baseName(result.path)}` : `已保存 · ${new Date().toLocaleTimeString()}`
+        )
+      } else if (result.error) {
+        setStatus(`保存失败：${result.error}`)
       }
-      if (result.error) setStatus(`保存失败：${result.error}`)
-      return false
+      return result.ok
     } catch (err) {
       setStatus(`保存失败：${(err as Error).message}`)
       return false
     } finally {
+      savingRef.current = false
       setBusy(false)
     }
   }, [])
 
-  const doSaveAs = useCallback(async (): Promise<void> => {
-    const { content: text, filePath: p } = stateRef.current
-    setBusy(true)
-    try {
-      const result = await window.api.saveFileAs(text, p ?? undefined)
-      if (result.ok) {
-        setFilePath(result.path)
-        setSavedContent(text)
-        setStatus(`已另存为 ${baseName(result.path)}`)
-      } else if (result.error) {
-        setStatus(`保存失败：${result.error}`)
-      }
-    } finally {
-      setBusy(false)
-    }
-  }, [])
-
+  /** 通过系统文件对话框打开文档。 */
   const doOpen = useCallback(async (): Promise<void> => {
+    if (savingRef.current) return
     if (!confirmDiscard('当前文档有未保存的修改，打开其他文件将丢弃这些修改。继续？')) return
     const result = await window.api.openFile()
     if (result.ok) loadDocument(result.path, result.content)
     else if (result.error) setStatus(`打开失败：${result.error}`)
   }, [confirmDiscard, loadDocument])
 
+  /** 创建独立的笔记窗口。 */
   const doNewWindow = useCallback((): void => {
     window.api.newWindow()
   }, [])
 
+  /** 打开拖入或从最近列表选择的文档。 */
   const openExternalPath = useCallback(
     async (path: string): Promise<void> => {
+      if (savingRef.current) return
       if (!confirmDiscard('当前文档有未保存的修改，打开新文件将丢弃这些修改。继续？')) return
       const result = await window.api.openPath(path)
       if (result.ok) loadDocument(result.path, result.content)
@@ -360,6 +365,7 @@ export default function App() {
     [confirmDiscard, loadDocument]
   )
 
+  /** 切换最近文件菜单，打开时更新文件列表。 */
   const toggleRecentMenu = useCallback(async (): Promise<void> => {
     if (recentOpen) {
       setRecentOpen(false)
@@ -369,6 +375,7 @@ export default function App() {
     setRecentOpen(true)
   }, [recentOpen])
 
+  /** 关闭最近文件菜单并打开选中的文档。 */
   const openRecentFile = useCallback(
     (path: string): void => {
       setRecentOpen(false)
@@ -377,6 +384,7 @@ export default function App() {
     [openExternalPath]
   )
 
+  /** 清空最近文件记录并更新菜单。 */
   const clearRecentFiles = useCallback(async (): Promise<void> => {
     await window.api.clearRecentFiles()
     setRecentFiles([])
@@ -385,9 +393,11 @@ export default function App() {
   // 最近文件下拉：点击外部或按 Esc 关闭
   useEffect(() => {
     if (!recentOpen) return
+    /** 点击菜单以外的位置时关闭菜单。 */
     const onMouseDown = (e: MouseEvent): void => {
       if (recentRef.current && !recentRef.current.contains(e.target as Node)) setRecentOpen(false)
     }
+    /** 按下退出键时关闭菜单。 */
     const onKeyDown = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') setRecentOpen(false)
     }
@@ -399,7 +409,7 @@ export default function App() {
     }
   }, [recentOpen])
 
-  // Ctrl+F：按当前视图与最近交互的窗格决定搜索目标（分屏时跟随焦点所在窗格）
+  /** 在当前视图或分屏中最近交互的窗格打开查找。 */
   const openFind = useCallback((): void => {
     const target =
       viewMode === 'preview' ? 'preview' : viewMode === 'edit' ? 'editor' : activePaneRef.current
@@ -411,10 +421,12 @@ export default function App() {
     }
   }, [viewMode])
 
+  /** 关闭预览查找条。 */
   const closePreviewSearch = useCallback((): void => {
     setPreviewSearchOpen(false)
   }, [])
 
+  /** 循环切换预览查找的当前匹配项。 */
   const stepPreviewMatch = useCallback(
     (delta: number): void => {
       if (previewCount === 0) return
@@ -438,6 +450,7 @@ export default function App() {
 
   // 键盘兜底：菜单快捷键未拦截时仍能触发查找；Esc 关闭预览查找条
   useEffect(() => {
+    /** 处理查找和关闭查找条的键盘操作。 */
     const onKeyDown = (e: KeyboardEvent): void => {
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'f') {
         e.preventDefault()
@@ -450,6 +463,7 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [openFind, previewSearchOpen, closePreviewSearch])
 
+  /** 请求下载更新并显示失败原因。 */
   const doDownloadUpdate = useCallback(async (): Promise<void> => {
     setUpdateBusy(true)
     setStatus('正在下载更新…')
@@ -458,6 +472,7 @@ export default function App() {
     if (!result.ok) setStatus(`下载更新失败：${result.message ?? '未知错误'}`)
   }, [])
 
+  /** 执行应用菜单或窗口快捷键发送的操作。 */
   const handleMenuAction = useCallback(
     (action: string) => {
       switch (action) {
@@ -465,10 +480,10 @@ export default function App() {
           void doOpen()
           break
         case 'save':
-          void doSave()
+          void saveDocument()
           break
         case 'save-as':
-          void doSaveAs()
+          void saveDocument(true)
           break
         case 'find':
           openFind()
@@ -484,7 +499,7 @@ export default function App() {
           break
       }
     },
-    [doOpen, doSave, doSaveAs, openFind]
+    [doOpen, saveDocument, openFind]
   )
 
   // 订阅主进程事件 + 读取启动时传入的文件
@@ -505,6 +520,60 @@ export default function App() {
     window.api.setDocState({ dirty, path: filePath })
   }, [dirty, filePath])
 
+  /** 重读当前文档，自动刷新时保留尚未保存的编辑。 */
+  const reloadDocument = useCallback(
+    async (manual = false): Promise<void> => {
+      const before = stateRef.current
+      const path = before.filePath
+      if (!path || savingRef.current || (!manual && reloadRef.current?.manual)) return
+      if (manual && !confirmDiscard('重新读取文件将丢弃当前未保存的修改。继续？')) return
+      const request = { manual }
+      reloadRef.current = request
+      try {
+        const result = await window.api.reloadFile(path)
+        const current = stateRef.current
+        if (reloadRef.current !== request || current.filePath !== path) return
+        if (!result.ok) {
+          if (manual) setStatus(`刷新失败：${result.error ?? '无法读取文件'}`)
+          return
+        }
+        if (result.content === current.savedContent && (!manual || !current.dirty)) {
+          if (manual) setStatus('文件内容已是最新')
+          return
+        }
+        const canDiscardEdits = manual && current.content === before.content
+        if (current.dirty && current.content !== result.content && !canDiscardEdits) {
+          setStatus(
+            manual
+              ? '刷新期间产生了新的编辑，当前内容已保留。'
+              : '文件已在外部修改，当前编辑已保留。可刷新或另存为。'
+          )
+          return
+        }
+        setContent(result.content)
+        setSavedContent(result.content)
+        setStatus(manual ? `已刷新 ${baseName(path)}` : `已重新载入外部修改 · ${baseName(path)}`)
+      } catch (err) {
+        if (manual && reloadRef.current === request) setStatus(`刷新失败：${(err as Error).message}`)
+      } finally {
+        if (reloadRef.current === request) reloadRef.current = null
+      }
+    },
+    [confirmDiscard]
+  )
+
+  useEffect(() => {
+    if (!filePath || busy) return
+    /** 仅处理当前文档的变动，忽略切换文档前发出的事件。 */
+    const onFileChanged = (path: string): void => {
+      if (path === filePath) void reloadDocument()
+    }
+    const unsubscribe = window.api.onFileChanged(onFileChanged)
+    // 补查注册监听前及保存期间的文件变动。
+    void reloadDocument()
+    return unsubscribe
+  }, [filePath, busy, reloadDocument])
+
   // 订阅更新事件；新窗口打开时恢复主进程已有的更新状态
   useEffect(() => {
     const off = window.api.onUpdateEvent((event) => {
@@ -517,7 +586,9 @@ export default function App() {
 
   // 拖拽打开
   useEffect(() => {
+    /** 允许在窗口中放下文件。 */
     const onDragOver = (e: DragEvent): void => e.preventDefault()
+    /** 验证拖入的是 Markdown 文件并打开。 */
     const onDrop = (e: DragEvent): void => {
       e.preventDefault()
       const file = e.dataTransfer?.files?.[0]
@@ -540,6 +611,7 @@ export default function App() {
   // 粘贴图片：剪贴板里的位图或图片文件先落盘，再在光标处插入 Markdown 图片语法。
   // 用捕获阶段监听，避免 CodeMirror 先按纯文本处理；普通文本粘贴不受影响。
   useEffect(() => {
+    /** 将剪贴板中的图片保存到磁盘并插入 Markdown 引用。 */
     const onPaste = (e: ClipboardEvent): void => {
       const data = e.clipboardData
       if (!data) return
@@ -598,8 +670,9 @@ export default function App() {
     return () => window.removeEventListener('paste', onPaste, true)
   }, [insertMarkdown])
 
+  /** 保存成功后关闭窗口。 */
   const closeAndSave = async (): Promise<void> => {
-    const ok = await doSave()
+    const ok = await saveDocument()
     if (ok) {
       setCloseDialogOpen(false)
       window.api.forceClose()
@@ -665,13 +738,23 @@ export default function App() {
               </div>
             )}
           </div>
-          <button onClick={() => void doSave()} disabled={busy} title="保存 (Ctrl+S)">
+          <button onClick={() => void saveDocument()} disabled={busy} title="保存 (Ctrl+S)">
             <Icon d={ICONS.save} />
             <span>{busy ? '保存中…' : '保存'}</span>
           </button>
-          <button onClick={() => void doSaveAs()} disabled={busy} title="另存为 (Ctrl+Shift+S)">
+          <button onClick={() => void saveDocument(true)} disabled={busy} title="另存为 (Ctrl+Shift+S)">
             <span>另存为</span>
           </button>
+          {filePath && (
+            <button
+              onClick={() => void reloadDocument(true)}
+              disabled={busy}
+              title="从磁盘重新读取文件"
+            >
+              <Icon d={ICONS.refresh} />
+              <span>刷新</span>
+            </button>
+          )}
         </div>
         <div className="toolbar-group view-switch" role="tablist" aria-label="视图模式">
           {(Object.keys(viewLabels) as ViewMode[]).map((mode) => (
@@ -810,7 +893,7 @@ export default function App() {
                 />
               </div>
             </div>
-            <Toc content={content} rootRef={previewRootRef} scrollRef={previewScrollRef} />
+            <Toc key={filePath} content={content} rootRef={previewRootRef} scrollRef={previewScrollRef} />
           </section>
         )}
       </main>
@@ -862,7 +945,11 @@ export default function App() {
           {filePath ?? '未命名文档'}
           {dirty && <span className="dirty-flag"> ● 未保存</span>}
         </span>
-        <span className="status-message" title="操作状态提示：打开、保存、检查更新等结果会显示在这里">
+        <span
+          className="status-message"
+          role="status"
+          title="操作状态提示：打开、保存、检查更新等结果会显示在这里"
+        >
           {status}
         </span>
         <span className="status-meta" title="当前文档的字符数与行数">

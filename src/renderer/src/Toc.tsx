@@ -1,3 +1,4 @@
+/** 显示 Markdown 标题目录，定位并展开预览中的目标章节。 */
 import {
   useCallback,
   useEffect,
@@ -6,7 +7,7 @@ import {
   useState,
   type RefObject
 } from 'react'
-import { flashAnchor } from './Preview'
+import { flashAnchor, revealFoldedSections } from './Preview'
 
 interface TocHeading {
   id: string
@@ -23,6 +24,7 @@ interface RailItem {
 const DASH_WIDTH: Record<number, number> = { 1: 22, 2: 18, 3: 14, 4: 11, 5: 9, 6: 9 }
 const STORE_KEY = 'mkdown.toc.pinned'
 
+/** 将标题文本转换为稳定的页内锚点。 */
 function slugify(text: string): string {
   return text
     .trim()
@@ -31,6 +33,7 @@ function slugify(text: string): string {
     .replace(/\s+/g, '-')
 }
 
+/** 读取是否固定显示目录的偏好。 */
 function readPinned(): boolean {
   try {
     return localStorage.getItem(STORE_KEY) === '1'
@@ -39,6 +42,7 @@ function readPinned(): boolean {
   }
 }
 
+/** 渲染目录控件使用的装饰图标。 */
 function TocIcon({ d }: { d: string }) {
   return (
     <svg
@@ -107,35 +111,37 @@ export function Toc({
     setHeadings(next)
   }, [content, rootRef])
 
-  // 横线在栏内的纵向位置 = 标题在文档中的位置 / 文档总高（与滚动无关，布局变化时重测）
+  /** 根据可见标题在文档中的位置更新缩略栏横线。 */
   const measure = useCallback(() => {
     const scroll = scrollRef.current
     if (!scroll || scroll.scrollHeight === 0) return
     const viewTop = scroll.getBoundingClientRect().top
     const total = scroll.scrollHeight
     setRail(
-      headings.map((h) => {
+      headings.flatMap((h) => {
         const el = elsRef.current.get(h.id)
-        const docTop = el ? el.getBoundingClientRect().top - viewTop + scroll.scrollTop : 0
-        return { id: h.id, frac: Math.min(1, Math.max(0, docTop / total)) }
+        if (!el?.getClientRects().length) return []
+        const docTop = el.getBoundingClientRect().top - viewTop + scroll.scrollTop
+        return [{ id: h.id, frac: Math.min(1, Math.max(0, docTop / total)) }]
       })
     )
   }, [headings, scrollRef])
 
-  // 滚动监听：最后一个越过视口上缘的标题为当前标题
+  /** 标记最后一个越过视口上缘的可见标题。 */
   const updateActive = useCallback(() => {
     const scroll = scrollRef.current
     if (!scroll || headings.length === 0) return
     const threshold = scroll.getBoundingClientRect().top + 90
-    let current = headings[0].id
+    let current = ''
+    let lastVisible = ''
     for (const h of headings) {
       const el = elsRef.current.get(h.id)
-      if (!el) continue
-      if (el.getBoundingClientRect().top <= threshold) current = h.id
-      else break
+      if (!el?.getClientRects().length) continue
+      lastVisible = h.id
+      if (!current || el.getBoundingClientRect().top <= threshold) current = h.id
     }
     if (scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4) {
-      current = headings[headings.length - 1].id
+      current = lastVisible
     }
     setActiveId(current)
   }, [headings, scrollRef])
@@ -145,24 +151,36 @@ export function Toc({
     updateActive()
   }, [measure, updateActive])
 
-  // 图片 / mermaid 异步渲染改变文档高度时重测横线位置
+  // 折叠章节或图片、图表改变文档布局时重测横线位置。
   useEffect(() => {
     const scroll = scrollRef.current
     const root = rootRef.current
     if (!scroll || !root) return
-    const ro = new ResizeObserver(() => {
-      measure()
-      updateActive()
-    })
+    let raf = 0
+    /** 合并同一帧内的布局变化和章节折叠事件。 */
+    const remeasure = (): void => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => {
+        measure()
+        updateActive()
+      })
+    }
+    const ro = new ResizeObserver(remeasure)
     ro.observe(scroll)
     ro.observe(root)
-    return () => ro.disconnect()
+    root.addEventListener('toggle', remeasure, true)
+    return () => {
+      ro.disconnect()
+      root.removeEventListener('toggle', remeasure, true)
+      cancelAnimationFrame(raf)
+    }
   }, [measure, updateActive, rootRef, scrollRef])
 
   useEffect(() => {
     const scroll = scrollRef.current
     if (!scroll) return
     let raf = 0
+    /** 在浏览器绘制前刷新当前标题。 */
     const onScroll = (): void => {
       cancelAnimationFrame(raf)
       raf = requestAnimationFrame(updateActive)
@@ -188,12 +206,13 @@ export function Toc({
     listRef.current?.querySelector('.toc-item.active')?.scrollIntoView({ block: 'nearest' })
   }, [activeId, pinned, expanded])
 
-  // 目录跳转：标题对齐到视口上缘（滚动监听随即把它标记为当前标题），并播放高亮
+  /** 展开并定位目录中的目标标题，再短暂高亮。 */
   const jump = useCallback(
     (id: string): void => {
       const scroll = scrollRef.current
       const el = elsRef.current.get(id)
       if (scroll && el) {
+        revealFoldedSections(el)
         const top =
           el.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop
         scroll.scrollTop = Math.max(0, top - 12)
